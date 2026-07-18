@@ -593,16 +593,27 @@ class BaccaratManager:
                 self.tables[game_token]['ws'] = ws
                 self.tables[game_token]['status'] = "Connected"
                 
-                # ⚡ TCP_NODELAY: Disable Nagle's algorithm for instant packet sends
+                # ⚡ Socket tuning: TCP_NODELAY + Keep-Alive
                 try:
                     transport = ws.transport
                     if transport:
                         sock = transport.get_extra_info('socket')
                         if sock:
+                            # 1. Disable Nagle's algorithm for instant sends
                             sock.setsockopt(_socket_mod.IPPROTO_TCP, _socket_mod.TCP_NODELAY, 1)
-                            logger.debug(f"[{self.name}] TCP_NODELAY set for {self.tables[game_token].get('name', game_token[:8])}")
+                            # 2. Enable SO_KEEPALIVE to detect half-open connections
+                            sock.setsockopt(_socket_mod.SOL_SOCKET, _socket_mod.SO_KEEPALIVE, 1)
+                            # 3. Configure aggressive Keep-Alive parameters (if supported by OS)
+                            if hasattr(_socket_mod, "TCP_KEEPIDLE"):
+                                sock.setsockopt(_socket_mod.IPPROTO_TCP, _socket_mod.TCP_KEEPIDLE, 5)
+                                sock.setsockopt(_socket_mod.IPPROTO_TCP, _socket_mod.TCP_KEEPINTVL, 2)
+                                sock.setsockopt(_socket_mod.IPPROTO_TCP, _socket_mod.TCP_KEEPCNT, 3)
+                            elif hasattr(_socket_mod, "TCP_KEEPALIVE") and not hasattr(_socket_mod, "TCP_KEEPIDLE"):
+                                # macOS fallback
+                                sock.setsockopt(_socket_mod.IPPROTO_TCP, _socket_mod.TCP_KEEPALIVE, 5)
+                            logger.debug(f"[{self.name}] TCP tuning (NODELAY + KEEPALIVE) set for {self.tables[game_token].get('name', game_token[:8])}")
                 except Exception as e:
-                    logger.debug(f"[{self.name}] TCP_NODELAY failed: {e}")
+                    logger.debug(f"[{self.name}] TCP socket tuning failed: {e}")
                 
                 logger.info(f"[{self.name}] Connected to {self.tables[game_token].get('name', game_token[:8])}")
                 
@@ -913,7 +924,7 @@ class BaccaratManager:
             self._coordinator_ref.check_auto_bet()
 
     async def _heartbeat_loop(self):
-        SILENCE_TIMEOUT = 20  # Seconds without ANY message = zombie WS → force close (was 45)
+        SILENCE_TIMEOUT = 8  # Seconds without ANY message = zombie WS → force close
         while self.running:
             # Snapshot to avoid dict-changed-size-during-iteration errors
             items = list(self.tables.items())
@@ -927,7 +938,7 @@ class BaccaratManager:
                     except Exception as e:
                         logger.debug(f"[{self.name}] Heartbeat send failed for {info.get('name', token[:8])}: {e}")
 
-                    # 2. Silence watchdog: if WS reports open but no messages for 60s, force-close
+                    # 2. Silence watchdog: if WS reports open but no messages for 8s, force-close
                     last_msg = info.get('last_msg_at', 0)
                     if last_msg > 0 and (now - last_msg) > SILENCE_TIMEOUT:
                         tname = info.get('name', token[:8])
@@ -939,7 +950,7 @@ class BaccaratManager:
                             await ws.close()
                         except Exception:
                             pass
-            await asyncio.sleep(3)  # Heartbeat every 3s — fast zombie detection
+            await asyncio.sleep(1)  # Heartbeat every 1s — ultra-fast zombie detection
 
     async def _balance_loop(self):
         """Balance loop — runs blocking HTTP in thread executor to not block event loop."""
@@ -1368,13 +1379,32 @@ class GlobalCoordinator:
             remaining = max(12.0 - worst_elapsed, 0)
             valid_tables.append((token, info, remaining))
 
+        # ═══ PRE-CHECK: ALL 4 TABLES MUST BE CONNECTED ═══
+        # Before firing on best 2, verify every single table is alive on both accounts
+        all_tables_connected = True
+        for token, info in list(self.account1.tables.items()):
+            tname = info.get('name', token[:8])
+            ws1 = self.account1.tables.get(token, {}).get('ws')
+            ws2 = self.account2.tables.get(token, {}).get('ws')
+            status1 = self.account1.tables.get(token, {}).get('status', 'Unknown')
+            status2 = self.account2.tables.get(token, {}).get('status', 'Unknown')
+            if ws1 is None or status1 in ['Disconnected', 'Reconnecting...', 'Connecting...']:
+                logger.debug(f"🚫 {tname} Acc1 not connected (status={status1}) — holding fire")
+                all_tables_connected = False
+            if ws2 is None or status2 in ['Disconnected', 'Reconnecting...', 'Connecting...']:
+                logger.debug(f"🚫 {tname} Acc2 not connected (status={status2}) — holding fire")
+                all_tables_connected = False
+        
+        if not all_tables_connected:
+            return  # Silent return — hunter will retry in 100ms
+
         # ═══ SMART TABLE SELECTION ═══
-        # Sort by MOST time remaining first — pick freshest 2 tables
+        # All 4 tables confirmed connected — now pick freshest 2 to fire on
         if len(valid_tables) >= 2:
             valid_tables.sort(key=lambda x: x[2], reverse=True)  # Most remaining time first for SELECTION
             best_remaining = min(valid_tables[0][2], valid_tables[1][2])
             logger.info(
-                f"🧠 SMART TIMING: {len(valid_tables)} tables ready | "
+                f"🧠 SMART TIMING: {len(valid_tables)} tables ready (all 4 connected) | "
                 f"Best pair: {valid_tables[0][1].get('name','?')} ({valid_tables[0][2]:.1f}s) + "
                 f"{valid_tables[1][1].get('name','?')} ({valid_tables[1][2]:.1f}s) | "
                 f"Worst remaining: {best_remaining:.1f}s"
@@ -1407,7 +1437,7 @@ class GlobalCoordinator:
             t1_token, t1_info = target_tables[0]
             t2_token, t2_info = target_tables[1]
             t1_max = t1_info.get('max_bet', 100.0)
-            t2_max = self.account2.tables[t2_token].get('max_bet', 100.0)
+            t2_max = self.account2.tables.get(t2_token, {}).get('max_bet', 100.0)
             max_allowed_bet = min(t1_max, t2_max)
 
             # 🔥 RACE CONDITION BYPASS: We intentionally do NOT divide the balance by 2.
@@ -1533,8 +1563,9 @@ class GlobalCoordinator:
                 fire_elapsed = (time.time() - fire_start) * 1000
                 
                 # Check if we successfully queued all 4 bets (2 tables * 2 accounts = 4 jobs)
-                if len(firing_jobs) < len(tables) * 2:
-                    logger.warning(f"⚡ Queue mismatch: only {len(firing_jobs)}/{len(tables)*2} jobs pre-resolved!")
+                expected_jobs = len(tables) * 2  # 4 tables × 2 accounts = 8 jobs
+                if len(firing_jobs) < expected_jobs:
+                    logger.warning(f"⚡ Queue mismatch: only {len(firing_jobs)}/{expected_jobs} jobs pre-resolved!")
                     send_failed = True
                 
                 # Log timing and status
@@ -1992,6 +2023,137 @@ class GlobalCoordinator:
         return {
             "success": True,
             "message": f"Account {account_num} re-logged as {username}! Press Arm to resume."
+        }
+
+    # ══════════════════════════════════════════════════════════════════
+    # 🧪 STACK TEST: Send 2 rapid bets on SAME table to test if server
+    #    accumulates them (proof-of-concept for single-table stacking)
+    # ══════════════════════════════════════════════════════════════════
+    def test_stack_bet(self):
+        """Send 2 × ₹50 Player bets on one table from Account 1 only.
+        Checks if server accumulates (total ₹100) or replaces/rejects."""
+        logger.info("🧪 [STACK TEST] Starting single-table stacking test...")
+
+        # Find a table with betting window open on Account 1
+        target_token = None
+        target_name = None
+        for token, info in list(self.account1.tables.items()):
+            if info.get('is_betting_open') and info.get('ws'):
+                ws = info.get('ws')
+                transport = getattr(ws, 'transport', None)
+                if transport:
+                    target_token = token
+                    target_name = info.get('name', token[:8])
+                    break
+
+        if not target_token:
+            return {"success": False, "message": "No table with open betting window found. Wait for a table to open."}
+
+        logger.info(f"🧪 [STACK TEST] Target: {target_name} | Sending 2 × ₹50 Player bets...")
+
+        # Record balance before
+        self.account1.update_balance()
+        bal_before = self.account1.balance
+        if bal_before < 100:
+            return {"success": False, "message": f"Balance too low for test ({bal_before:.2f}). Need at least ₹100."}
+
+        # Register pending acks
+        self.account1.pending_bet_acks[target_token] = {'status': 'pending', 'raw': None}
+
+        # Build 2 separate ₹50 bet frames
+        frame1 = BaccaratManager._build_raw_bet_frame(50.0, config.BACCARAT_PLAYER_BET_TYPE)
+        frame2 = BaccaratManager._build_raw_bet_frame(50.0, config.BACCARAT_PLAYER_BET_TYPE)
+
+        ws = self.account1.tables[target_token]['ws']
+        transport = ws.transport
+
+        # 🚀 Fire both frames with GC disabled for maximum speed
+        fire_start = time.time()
+        gc.disable()
+        try:
+            self.account1.loop.call_soon_threadsafe(transport.write, frame1)
+            self.account1.loop.call_soon_threadsafe(transport.write, frame2)
+        finally:
+            gc.enable()
+        fire_elapsed = (time.time() - fire_start) * 1000
+
+        logger.info(f"🧪 [STACK TEST] 2 × ₹50 bets FIRED in {fire_elapsed:.2f}ms on {target_name}")
+
+        # Wait for confirmations (up to 2 seconds)
+        results = []
+        for poll in range(20):
+            time.sleep(0.1)
+            ack = self.account1.pending_bet_acks.get(target_token, {})
+            status = ack.get('status', 'pending')
+            if status != 'pending':
+                results.append(status)
+                # Reset and check for second ack
+                self.account1.pending_bet_acks[target_token] = {'status': 'pending', 'raw': None}
+                if len(results) >= 2:
+                    break
+
+        # Check balance after
+        time.sleep(0.3)
+        self.account1.update_balance()
+        bal_after = self.account1.balance
+        bal_diff = bal_before - bal_after
+
+        # Analyze results
+        if bal_diff >= 95:  # ~₹100 deducted (both bets accepted)
+            verdict = "✅ STACKING WORKS! Server accumulated both bets."
+            stacking_works = True
+        elif bal_diff >= 45:  # ~₹50 deducted (only one bet accepted)
+            verdict = "⚠️ Only 1 bet accepted. Server may replace or ignore duplicates."
+            stacking_works = False
+        elif bal_diff <= 5:  # No deduction (both rejected or undo needed)
+            verdict = "❌ No bets accepted. Server rejected rapid stacking."
+            stacking_works = False
+        else:
+            verdict = f"🤔 Unexpected balance change: ₹{bal_diff:.2f}"
+            stacking_works = False
+
+        result_msg = (
+            f"🧪 STACK TEST RESULT\n"
+            f"Table: {target_name}\n"
+            f"Bets sent: 2 × ₹50 in {fire_elapsed:.2f}ms\n"
+            f"Balance before: ₹{bal_before:.2f}\n"
+            f"Balance after: ₹{bal_after:.2f}\n"
+            f"Deducted: ₹{bal_diff:.2f}\n"
+            f"Ack statuses: {results}\n"
+            f"Verdict: {verdict}"
+        )
+        logger.info(f"🧪 [STACK TEST] {result_msg}")
+
+        # Send UNDO to clean up the test bets
+        try:
+            undo_frame = BaccaratManager._build_raw_bet_frame(0.0, config.BACCARAT_PLAYER_BET_TYPE)
+            undo_payload = json.dumps({
+                "arguments": [{"type": 1, "data": json.dumps({
+                    "areBetsInZeroCommMode": False,
+                    "bets": [],
+                    "gameplayMessageType": 7
+                })}],
+                "target": "Message", "type": 1
+            }) + '\x1e'
+            if self.account1.loop:
+                self.account1.loop.call_soon_threadsafe(ws.send, undo_payload)
+                logger.info(f"🧪 [STACK TEST] UNDO sent to clean up test bets")
+        except Exception as e:
+            logger.warning(f"🧪 [STACK TEST] UNDO cleanup failed: {e}")
+
+        return {
+            "success": True,
+            "stacking_works": stacking_works,
+            "message": result_msg,
+            "details": {
+                "table": target_name,
+                "fire_ms": round(fire_elapsed, 2),
+                "bal_before": bal_before,
+                "bal_after": bal_after,
+                "deducted": round(bal_diff, 2),
+                "ack_statuses": results,
+                "verdict": verdict
+            }
         }
 
 

@@ -1432,6 +1432,9 @@
                     <button class="btn btn-outline" onclick="exportData()" title="Download profitable bet history as JSON" style="font-size:11px; padding:8px 12px;">
                         📥
                     </button>
+                    <button id="stack-test-btn" class="btn btn-outline" onclick="testStackBet()" title="🧪 Test if server accepts multiple bets on same table" style="font-size:11px; padding:8px 12px; border-color: #f59e0b; color: #f59e0b;">
+                        🧪 Stack Test
+                    </button>
                 </div>
             </div>
         </div>
@@ -1971,6 +1974,42 @@
                 toast('Cache Cleared', 'All results, history, and bet data have been reset.', 'info', 3000);
             }
         } catch(e) {}
+    }
+
+    async function testStackBet() {
+        const btn = document.getElementById('stack-test-btn');
+        btn.disabled = true;
+        btn.innerHTML = '⏳ Testing...';
+        btn.style.opacity = '0.5';
+        toast('Stack Test', 'Sending 2 × ₹50 rapid bets to one table...', 'info', 3000);
+        
+        try {
+            const res = await fetch('/api/test_stack', {method: 'POST'});
+            const data = await res.json();
+            
+            if (data.success && data.details) {
+                const d = data.details;
+                const color = data.stacking_works ? 'info' : 'warn';
+                toast(
+                    '🧪 Stack Test Result',
+                    `${d.verdict}\n` +
+                    `Table: ${d.table}\n` +
+                    `Fire speed: ${d.fire_ms}ms\n` +
+                    `Balance: ₹${d.bal_before} → ₹${d.bal_after} (−₹${d.deducted})\n` +
+                    `Acks: ${d.ack_statuses.join(', ') || 'none received'}`,
+                    color,
+                    15000
+                );
+            } else {
+                toast('🧪 Stack Test', data.message || 'Test failed', 'warn', 8000);
+            }
+        } catch(e) {
+            toast('🧪 Stack Test Error', e.message, 'warn', 5000);
+        } finally {
+            btn.disabled = false;
+            btn.innerHTML = '🧪 Stack Test';
+            btn.style.opacity = '1';
+        }
     }
 
     async function exportData() {
