@@ -514,7 +514,7 @@ class BaccaratManager:
 
     async def connect_websocket(self, game_token, access_token):
         """Connect to a table's WebSocket with automatic reconnection on failure."""
-        reconnect_delay = INITIAL_RECONNECT_DELAY
+        self.tables[game_token]['reconnect_delay'] = INITIAL_RECONNECT_DELAY
 
         while self.running:
             if access_token:
@@ -535,11 +535,16 @@ class BaccaratManager:
             self.tables[game_token]['is_betting_open'] = False
             self.tables[game_token]['ws'] = None
 
-            logger.info(f"[{self.name}] Reconnecting {self.tables[game_token].get('name', game_token[:8])} in {reconnect_delay}s...")
-            await asyncio.sleep(reconnect_delay)
+            delay = self.tables[game_token].get('reconnect_delay', INITIAL_RECONNECT_DELAY)
+            logger.info(f"[{self.name}] Reconnecting {self.tables[game_token].get('name', game_token[:8])} in {delay}s...")
+            await asyncio.sleep(delay)
 
-            # Exponential backoff: 5 -> 10 -> 20 -> 40 -> 60 (capped)
-            reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY)
+            # Exponential backoff (unless overridden for fast reconnect)
+            if delay >= INITIAL_RECONNECT_DELAY:
+                self.tables[game_token]['reconnect_delay'] = min(delay * 2, MAX_RECONNECT_DELAY)
+            else:
+                # Reset to normal reconnect delay after fast trigger
+                self.tables[game_token]['reconnect_delay'] = INITIAL_RECONNECT_DELAY
 
             # Re-authenticate before reconnecting (tokens may have expired or need initial fetch)
             loop = asyncio.get_event_loop()
@@ -553,12 +558,12 @@ class BaccaratManager:
 
             if new_access_token:
                 access_token = new_access_token
-                reconnect_delay = INITIAL_RECONNECT_DELAY  # Reset backoff on successful auth
+                self.tables[game_token]['reconnect_delay'] = INITIAL_RECONNECT_DELAY  # Reset backoff on successful auth
             else:
                 access_token = None
                 # Cap delay at 10s for auth failures — fast retry with new proxy IP is key
-                reconnect_delay = min(reconnect_delay, 10)
-                logger.warning(f"[{self.name}] Re-auth failed for {game_token[:8]}, retrying in {reconnect_delay}s...")
+                self.tables[game_token]['reconnect_delay'] = min(self.tables[game_token].get('reconnect_delay', INITIAL_RECONNECT_DELAY), 10)
+                logger.warning(f"[{self.name}] Re-auth failed for {game_token[:8]}, retrying in {self.tables[game_token]['reconnect_delay']}s...")
 
     async def _connect_websocket_once(self, game_token, access_token):
         """Single WebSocket connection attempt. Raises on disconnect."""
@@ -1882,6 +1887,34 @@ class GlobalCoordinator:
                 expected_bal = bal_bef - (other_confirmed_count * bet_amt)
 
                 try:
+                    # 🚀 If attempt > 0, we suspect negative balance lockout! 
+                    # Let's perform a Hard Session Reset.
+                    if attempt > 0:
+                        logger.warning(f"🚨 {label} [{tname}] UNDO verification failed (attempt {attempt}). Suspecting negative balance lockout! Hard-killing transport to force instant reconnect...")
+                        ws = acct.tables.get(token, {}).get('ws')
+                        if ws:
+                            # 1. Force reconnect delay to 50ms (0.05s)
+                            acct.tables[token]['reconnect_delay'] = 0.05
+                            # 2. Hard close TCP transport
+                            try:
+                                if hasattr(ws, 'transport') and ws.transport:
+                                    ws.transport.close()
+                                    logger.info(f"✅ {label} [{tname}] Transport hard closed.")
+                            except Exception as transport_err:
+                                logger.error(f"🚨 {label} [{tname}] Transport close error: {transport_err}")
+                            
+                            # 3. Wait for new socket to connect
+                            reconnected = False
+                            for wait_idx in range(40):  # max 4 seconds
+                                time.sleep(0.1)
+                                current_ws = acct.tables.get(token, {}).get('ws')
+                                if current_ws and current_ws != ws:
+                                    logger.info(f"✅ {label} [{tname}] Reconnection detected! Proceeding to retry UNDO on fresh socket...")
+                                    reconnected = True
+                                    break
+                            if not reconnected:
+                                logger.warning(f"⚠️ {label} [{tname}] Reconnection timed out (4s), retrying on whatever is available...")
+
                     fut = asyncio.run_coroutine_threadsafe(
                         acct._undo_bets_async([token], bet_type=undo_bet_type, amount=bet_amt),
                         acct.loop
