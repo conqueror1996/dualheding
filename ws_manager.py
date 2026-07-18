@@ -1582,31 +1582,21 @@ class GlobalCoordinator:
                         d2 = delays.get((tok, 'acc2'), 0.0)
                         acc2_jobs.append((t2, prebuilt[(tok, 'acc2')], tname, d2))
                 
-                # Helper function executed inside the target loop's thread
-                # This writes all buffered frames with high-resolution spin-lock delay matching the latency alignment
-                def _write_batch(jobs):
-                    start = time.time()
-                    for transport, frame, tname_r, delay in jobs:
-                        # High-resolution spin-lock wait for microseconds level alignment
-                        while (time.time() - start) < delay:
-                            pass
-                        transport.write(frame)
+                # Sort all jobs together by delay descending (slowest link fired first)
+                all_jobs = acc1_jobs + acc2_jobs
+                all_jobs.sort(key=lambda x: x[3], reverse=True)
                 
-                # Sort jobs by delay descending so we fire slow ones (delay=0) first, 
-                # then wait for the spin-lock delay before firing fast ones.
-                acc1_jobs.sort(key=lambda x: x[3], reverse=True)
-                acc2_jobs.sort(key=lambda x: x[3], reverse=True)
-                
-                # Step 3: Fire batch writes grouped by account (GC frozen for zero interruption)
+                # Step 3: Fire directly on the current (Coordinator) thread to bypass event loop scheduling lag!
                 fire_start = time.time()
                 send_failed = False
                 
                 gc.disable()
                 try:
-                    if acc1_jobs and acc1.loop:
-                        acc1.loop.call_soon_threadsafe(_write_batch, acc1_jobs)
-                    if acc2_jobs and acc2.loop:
-                        acc2.loop.call_soon_threadsafe(_write_batch, acc2_jobs)
+                    for transport, frame, tname_r, delay in all_jobs:
+                        # Microsecond level delay alignment via spin-lock wait
+                        while (time.time() - fire_start) < delay:
+                            pass
+                        transport.write(frame)
                 except Exception as e:
                     logger.error(f"⚡ Firing loop execution failed: {e}")
                     send_failed = True
