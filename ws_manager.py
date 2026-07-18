@@ -1183,15 +1183,9 @@ class BaccaratManager:
         return [results_map[name] for _, name in wss_with_names]
 
     async def _undo_bets_async(self, targets, bet_type=None, amount=None):
-        """UNDO bets using DUAL-FORMAT approach (discovered from 7Mojos pentest extension):
-        
-        FORMAT 1 (type:7): The REAL unbet command from reverse-engineered protocol.
-          Inner message: {"type": 7}  — server-side unbet/cancel.
-        
-        FORMAT 2 (gameplayMessageType:1): Standard clear with empty bets array.
-          This is the game-client format for clearing the bet tray.
-        
-        We fire BOTH to maximize the chance of the server processing the undo."""
+        # FORMAT 2 (gameplayMessageType:7): The TRUE cancel/clear command from 7Mojos client.
+        #   Inner message: {"bets": [], "gameplayMessageType": 7} — cancels all confirmed bets.
+        # We fire BOTH to maximize the chance of the server processing the undo.
 
         # FORMAT 1: type:7 unbet (from pentest extension protocol capture)
         undo_type7_payload = {
@@ -1200,12 +1194,12 @@ class BaccaratManager:
         }
         undo_type7_msg = json.dumps(undo_type7_payload) + '\x1e'
 
-        # FORMAT 2: gameplayMessageType:1 with empty bets (game client clear)
+        # FORMAT 2: gameplayMessageType:7 with empty bets (game client clear)
         undo_clear_payload = {
             "arguments": [{"type": 1, "data": json.dumps({
                 "areBetsInZeroCommMode": False,
                 "bets": [],
-                "gameplayMessageType": 1
+                "gameplayMessageType": 7
             })}],
             "target": "Message", "type": 1
         }
@@ -1805,7 +1799,7 @@ class GlobalCoordinator:
         # This ensures undo reaches server while window is open
         # ══════════════════════════════════════════════════
         undo_type7 = json.dumps({"arguments": [json.dumps({"type": 7})], "target": "Message", "type": 1}) + '\x1e'
-        undo_clear = json.dumps({"arguments": [{"type": 1, "data": json.dumps({"areBetsInZeroCommMode": False, "bets": [], "gameplayMessageType": 1})}], "target": "Message", "type": 1}) + '\x1e'
+        undo_clear = json.dumps({"arguments": [{"type": 1, "data": json.dumps({"areBetsInZeroCommMode": False, "bets": [], "gameplayMessageType": 7})}], "target": "Message", "type": 1}) + '\x1e'
         
         blast_count = 0
         for tok, info in tables:
