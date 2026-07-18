@@ -185,6 +185,8 @@ class BaccaratManager:
         logger.info(f"[{self.name}] Rotated proxy session to {self.proxy_session_id} to bypass IP block/geographic restrictions.")
 
     def perform_login(self, base_url, username, password):
+        self._username = username
+        self._password = password
         self.login_status = f"Starting login for {self.name}..."
         logger.info(self.login_status)
         self.playcric_url     = base_url
@@ -471,6 +473,22 @@ class BaccaratManager:
                         return data.get('data', {}).get('accessToken')
                     else:
                         logger.warning(f"[{self.name}] Table auth rejected for {game_token}: success=false, response={resp.text[:200]}")
+                        
+                        # 🔄 AUTO-RELOGIN ON EXPIRED SESSION (errorCode 402)
+                        if data.get('errorCode') == 402 or "402" in resp.text:
+                            logger.warning(f"[{self.name}] 🚨 Session expired (errorCode 402). Attempting auto-relogin to refresh tokens...")
+                            if getattr(self, '_username', None) and getattr(self, '_password', None):
+                                relogin_res = self.perform_login(self.playcric_url, self._username, self._password)
+                                if relogin_res.get('success'):
+                                    logger.info(f"[{self.name}] ✅ Auto-relogin successful! Retrying table auth...")
+                                    payload["OperatorToken"] = self.operator_token
+                                    payload["PlayerToken"] = self.player_token
+                                    if attempt < max_retries:
+                                        time.sleep(0.5)
+                                        continue
+                                else:
+                                    logger.error(f"[{self.name}] ❌ Auto-relogin failed: {relogin_res.get('message')}")
+                        
                         if "blocked" in resp.text.lower() or "country" in resp.text.lower() or data.get('errorCode') == 11:
                             self.rotate_proxy_session()
                             if attempt < max_retries:
