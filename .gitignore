@@ -4,3 +4,8 @@ __pycache__/
 bet_history.json
 .DS_Store
 scratch/
+.env
+.env.*
+*.xlsx
+*.log
+*venv/

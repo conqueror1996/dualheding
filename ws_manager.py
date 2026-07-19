@@ -1199,12 +1199,12 @@ class BaccaratManager:
         }
         undo_type7_msg = json.dumps(undo_type7_payload) + '\x1e'
 
-        # FORMAT 2: gameplayMessageType:7 with empty bets (game client clear)
+        # FORMAT 2: gameplayMessageType:1 with empty bets (game client clear)
         undo_clear_payload = {
             "arguments": [{"type": 1, "data": json.dumps({
                 "areBetsInZeroCommMode": False,
                 "bets": [],
-                "gameplayMessageType": 7
+                "gameplayMessageType": 1
             })}],
             "target": "Message", "type": 1
         }
@@ -1794,7 +1794,7 @@ class GlobalCoordinator:
         # This ensures undo reaches server while window is open
         # ══════════════════════════════════════════════════
         undo_type7 = json.dumps({"arguments": [json.dumps({"type": 7})], "target": "Message", "type": 1}) + '\x1e'
-        undo_clear = json.dumps({"arguments": [{"type": 1, "data": json.dumps({"areBetsInZeroCommMode": False, "bets": [], "gameplayMessageType": 7})}], "target": "Message", "type": 1}) + '\x1e'
+        undo_clear = json.dumps({"arguments": [{"type": 1, "data": json.dumps({"areBetsInZeroCommMode": False, "bets": [], "gameplayMessageType": 1})}], "target": "Message", "type": 1}) + '\x1e'
         
         blast_count = 0
         for tok, info in tables:
@@ -2206,7 +2206,7 @@ class GlobalCoordinator:
                 "arguments": [{"type": 1, "data": json.dumps({
                     "areBetsInZeroCommMode": False,
                     "bets": [],
-                    "gameplayMessageType": 7
+                    "gameplayMessageType": 1
                 })}],
                 "target": "Message", "type": 1
             }) + '\x1e'
