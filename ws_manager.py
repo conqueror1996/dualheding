@@ -1576,52 +1576,35 @@ class GlobalCoordinator:
             reasons_str = " | ".join(f"{k}: {v}" for k, v in skip_reasons.items())
             logger.debug(f"🔍 Table scan: {len(valid_tables)} valid, {len(skip_reasons)} skipped [{reasons_str}]")
         
-        if len(valid_tables) >= 1:
-            low_balance = min(self.account1.balance, self.account2.balance)
-            CHIP_STEP = 90.0
-            total_chips = int(low_balance // CHIP_STEP)
-
-            if total_chips < 1:
-                logger.warning(f"Insufficient balance in low-balance account (Acc1={self.account1.balance:.2f}, Acc2={self.account2.balance:.2f}). Minimum ₹90 required.")
+        if len(valid_tables) >= 2:
+            if self.account1.balance < 90 or self.account2.balance < 90:
+                logger.warning("Insufficient balance in one or both accounts (minimum ₹90 required).")
                 self.auto_bet_requested = False
                 self.bet_state = "idle"
                 return
-
-            # Determine number of tables to target based on low balance capacity
-            if self.bet_mode == 'fixed':
-                req_bet = float((int(self.bet_target_amount) // int(CHIP_STEP)) * CHIP_STEP)
-                if len(valid_tables) >= 2 and low_balance >= (req_bet * 2):
-                    num_target_tables = 2
-                    bet_amount = req_bet
-                elif low_balance >= req_bet:
-                    num_target_tables = 1
-                    bet_amount = req_bet
-                else:
-                    logger.warning(f"Low-balance account ({low_balance:.2f} Rs) cannot afford fixed bet amount {req_bet:.2f} Rs.")
-                    self.auto_bet_requested = False
-                    self.bet_state = "idle"
-                    return
-            else:  # auto / max balance
-                if len(valid_tables) >= 2 and total_chips >= 2:
-                    num_target_tables = 2
-                    chips_per_table = total_chips // 2
-                    bet_amount = float(chips_per_table * CHIP_STEP)
-                else:
-                    num_target_tables = 1
-                    bet_amount = float(total_chips * CHIP_STEP)
-
-            target_tables = valid_tables[:num_target_tables]
+                
+            target_tables = valid_tables[:2]
             
-            # Apply table max limits
+            # Target bet size calculation based on bet_mode
             t1_token, t1_info = target_tables[0]
-            max_allowed_bet = t1_info.get('max_bet', 900000.0)
-            if len(target_tables) > 1:
-                t2_token, t2_info = target_tables[1]
-                t2_max = self.account2.tables.get(t2_token, {}).get('max_bet', 900000.0)
-                max_allowed_bet = min(max_allowed_bet, t2_max)
+            t2_token, t2_info = target_tables[1]
+            t1_max = t1_info.get('max_bet', 900000.0)
+            t2_max = self.account2.tables.get(t2_token, {}).get('max_bet', 900000.0)
+            max_allowed_bet = min(t1_max, t2_max)
 
-            bet_amount = min(bet_amount, max_allowed_bet)
+            # 🔥 RACE CONDITION BYPASS: Send full bet amount to BOTH tables simultaneously
+            effective_balance = min(self.account1.balance, self.account2.balance)
 
+            # Andar Bahar minimum chip is ₹90 (chips: 90, 180, 450, 900...)
+            CHIP_STEP = 90.0
+            if self.bet_mode == 'fixed':
+                base_bet = float((int(self.bet_target_amount) // int(CHIP_STEP)) * CHIP_STEP)
+                max_possible_bet = float((int(effective_balance) // int(CHIP_STEP)) * CHIP_STEP)
+                bet_amount = min(base_bet, max_possible_bet, max_allowed_bet)
+            else:  # auto
+                base_bet = float((int(effective_balance) // int(CHIP_STEP)) * CHIP_STEP)
+                bet_amount = min(base_bet, max_allowed_bet)
+            
             if bet_amount < CHIP_STEP:
                 logger.warning(f"Calculated bet amount {bet_amount:.2f} is below minimum chip size {CHIP_STEP}. Skipping round.")
                 self.auto_bet_requested = False
@@ -1632,16 +1615,15 @@ class GlobalCoordinator:
             bal2_before = self.account2.balance
             table_names = [info.get('name', token[:8]) for token, info in target_tables]
             
-            logger.info(f"🏦 Low-Balance Priority Sizing: Acc1={self.account1.balance:.2f} Acc2={self.account2.balance:.2f} | Low Balance={low_balance:.2f} | Firing on {len(target_tables)} table(s) | Bet={bet_amount:.2f}/table")
+            logger.info(f"🏦 Auto-Bet Sizing: Acc1={self.account1.balance:.2f} Acc2={self.account2.balance:.2f} | Hedge Bet={bet_amount:.2f} (Max limit: {max_allowed_bet:.2f})")
 
             # Build individual bet objects for UI tracking
-            individual_bets = []
-            bet_id = 0
-            for tbl_name in table_names:
-                individual_bets.append({"id": bet_id, "account": "Account 1", "bet_on": "Andar", "table": tbl_name, "amount": bet_amount, "status": "placing", "error": None})
-                bet_id += 1
-                individual_bets.append({"id": bet_id, "account": "Account 2", "bet_on": "Bahar", "table": tbl_name, "amount": bet_amount, "status": "placing", "error": None})
-                bet_id += 1
+            individual_bets = [
+                {"id": 0, "account": "Account 1", "bet_on": "Andar", "table": table_names[0], "amount": bet_amount, "status": "placing", "error": None},
+                {"id": 1, "account": "Account 1", "bet_on": "Andar", "table": table_names[1], "amount": bet_amount, "status": "placing", "error": None},
+                {"id": 2, "account": "Account 2", "bet_on": "Bahar", "table": table_names[0], "amount": bet_amount, "status": "placing", "error": None},
+                {"id": 3, "account": "Account 2", "bet_on": "Bahar", "table": table_names[1], "amount": bet_amount, "status": "placing", "error": None},
+            ]
 
             self.bet_state = "placing"
             self.last_bet_result = {
@@ -1786,8 +1768,7 @@ class GlobalCoordinator:
                     logger.info(f"⚡ Acc2 [{tname_r}] bet sent via ws.send()")
                 
                 if send_failed:
-                    logger.warning(f"⚡ DIRECT WRITE FAILED ({fire_elapsed:.1f}ms) — undoing ALL")
-                    self._undo_all_tables(acc1, acc2, tokens_used, tables, bet_amt, bal1_bef, bal2_bef)
+                    logger.warning(f"⚡ DIRECT WRITE FAILED ({fire_elapsed:.1f}ms) — re-arming for next round")
                     self._abort_and_rearm(bets, tables, "Direct write failed")
                     return
 
@@ -1891,7 +1872,7 @@ class GlobalCoordinator:
                             acc1.loop
                         )
                 else:
-                    # ❌ NOT ALL CONFIRMED → UNDO EVERYTHING
+                    # ❌ NOT ALL CONFIRMED — log and re-arm (NO undo — keeps connections stable)
                     status_summary = []
                     for tok, info in tables:
                         tname = info.get('name', tok[:8])
@@ -1899,10 +1880,7 @@ class GlobalCoordinator:
                         a2 = acc2.pending_bet_acks.get(tok, {}).get('status', '?')
                         status_summary.append(f"{tname}:P={a1}/B={a2}")
 
-                    logger.error(f"🚨 HEDGE BROKEN — UNDOING ALL BETS: {status_summary}")
-                    self._hedge_undone = True
-
-                    self._undo_all_tables(acc1, acc2, tokens_used, tables, bet_amt, bal1_bef, bal2_bef)
+                    logger.warning(f"⚠️ PARTIAL CONFIRMATION: {status_summary} — no undo, re-arming for next round")
 
                     for tok, _ in tables:
                         acc1.pending_bet_acks.pop(tok, None)
@@ -1910,17 +1888,17 @@ class GlobalCoordinator:
 
                     for b in bets:
                         if b['status'] != 'confirmed':
-                            b['status'] = 'undone'
-                            b['error'] = b.get('error') or 'Hedge broken — ALL bets undone'
+                            b['status'] = 'rejected'
+                            b['error'] = b.get('error') or 'Not confirmed by server'
 
                     self.last_bet_result = {
-                        "type": "undone",
+                        "type": "partial",
                         "tables": [info.get('name', tok[:8]) for tok, info in tables],
                         "bet1": bet_amt, "bet2": bet_amt,
-                        "bets": bets, "hedge_status": "broken",
-                        "reason": f"Not all 4 confirmed: {status_summary}"
+                        "bets": bets, "hedge_status": "partial",
+                        "reason": f"Partial: {status_summary}"
                     }
-                    logger.info("🔄 Auto re-arming for next round...")
+                    logger.info("🔄 Auto re-arming for next round (connections preserved)...")
                     self.auto_bet_requested = True
                     self.bet_state = "armed"
 
@@ -1953,160 +1931,7 @@ class GlobalCoordinator:
         self.auto_bet_requested = True
         self.bet_state = "armed"
 
-    def _undo_all_tables(self, acc1, acc2, tokens, tables, bet_amt, bal1_bef, bal2_bef):
-        """Undo bets on ALL tables: instant blast first, then retry+verify."""
-        logger.info(f"↩️↩️ UNDOING ALL {len(tokens)} TABLES...")
-        
-        # ══════════════════════════════════════════════════
-        # STEP 1: INSTANT RAW BLAST (transport.write) — <1ms
-        # Send undo frames BEFORE any async/thread overhead
-        # This ensures undo reaches server while window is open
-        # ══════════════════════════════════════════════════
-        undo_type7 = json.dumps({"arguments": [json.dumps({"type": 7})], "target": "Message", "type": 1}) + '\x1e'
-        undo_clear = json.dumps({"arguments": [{"type": 1, "data": json.dumps({"areBetsInZeroCommMode": False, "bets": [], "gameplayMessageType": 1})}], "target": "Message", "type": 1}) + '\x1e'
-        
-        blast_count = 0
-        for tok, info in tables:
-            tname = info.get('name', tok[:8])
-            for acct, label in [(acc1, 'Acc1'), (acc2, 'Acc2')]:
-                ws = acct.tables.get(tok, {}).get('ws')
-                if ws:
-                    transport = getattr(ws, 'transport', None)
-                    if transport:
-                        try:
-                            # Build raw WS frame for undo type:7
-                            for msg in [undo_type7, undo_clear]:
-                                raw = msg.encode('utf-8')
-                                length = len(raw)
-                                frame = bytearray([0x81])
-                                if length < 126:
-                                    frame.append(0x80 | length)
-                                elif length <= 65535:
-                                    frame.append(0x80 | 126)
-                                    frame.extend(length.to_bytes(2, 'big'))
-                                mask_key = os.urandom(4)
-                                frame.extend(mask_key)
-                                for i in range(length):
-                                    frame.append(raw[i] ^ mask_key[i % 4])
-                                if acct.loop:
-                                    acct.loop.call_soon_threadsafe(transport.write, bytes(frame))
-                                else:
-                                    transport.write(bytes(frame))
-                            blast_count += 1
-                        except Exception as e:
-                            logger.warning(f"↩️ {label} [{tname}] raw undo blast failed: {e}")
-        
-        logger.info(f"↩️ INSTANT BLAST: {blast_count}/{len(tokens)*2} undo frames sent via transport.write()")
-        
-        # ══════════════════════════════════════════════════
-        # STEP 2: ASYNC RETRY + VERIFY (threads) — backup
-        # In case raw blast was ignored, retry via ws.send()
-        # ══════════════════════════════════════════════════
-        undo_threads = []
-        for tok, info in tables:
-            tname = info.get('name', tok[:8])
-            t = threading.Thread(
-                target=self._undo_single_table,
-                args=(acc1, acc2, tok, tname, bet_amt, bal1_bef, bal2_bef),
-                daemon=True
-            )
-            undo_threads.append(t)
-            t.start()
-        for t in undo_threads:
-            t.join(timeout=8)
-        logger.info(f"↩️↩️ ALL TABLES UNDO COMPLETE")
 
-    def _undo_single_table(self, acc1, acc2, token, tname, bet_amt, bal1_bef, bal2_bef):
-        """Undo bets on a single table for both accounts with retry logic."""
-        logger.info(f"↩️ Undoing bets on '{tname}' for both accounts...")
-
-        def _undo_one_account(acct, label, undo_bet_type, bal_bef):
-            if not acct.loop or not acct.loop.is_running():
-                logger.error(f"🚨 {label}: loop not running — CANNOT UNDO!")
-                return
-
-            # If the bet on this table was never confirmed, it means no money was deducted.
-            # We don't need to verify any refund since no bet was placed on this table.
-            initial_status = acct.pending_bet_acks.get(token, {}).get('status', 'pending')
-            if initial_status != 'confirmed':
-                logger.info(f"✅ {label} UNDO on '{tname}' pre-verified (bet status was '{initial_status}', no locked funds)")
-                acct.pending_bet_acks[token] = {'status': 'undone', 'raw': 'Pre-verified'}
-                return
-
-            # Loop to send and verify the undo request
-            for attempt in range(3):
-                # Calculate expected balance for this specific table's undo.
-                # It should be the start balance (bal_bef) minus any OTHER tables that are still confirmed.
-                other_confirmed_count = 0
-                for t_tok, _ in acct.tables.items():
-                    if t_tok != token:
-                        t_status = acct.pending_bet_acks.get(t_tok, {}).get('status')
-                        if t_status == 'confirmed':
-                            other_confirmed_count += 1
-                expected_bal = bal_bef - (other_confirmed_count * bet_amt)
-
-                try:
-                    # 🚀 If attempt > 0, we suspect negative balance lockout! 
-                    # Let's perform a Hard Session Reset.
-                    if attempt > 0:
-                        logger.warning(f"🚨 {label} [{tname}] UNDO verification failed (attempt {attempt}). Suspecting negative balance lockout! Hard-killing transport to force instant reconnect...")
-                        ws = acct.tables.get(token, {}).get('ws')
-                        if ws:
-                            # 1. Force reconnect delay to 50ms (0.05s)
-                            acct.tables[token]['reconnect_delay'] = 0.05
-                            # 2. Hard close TCP transport
-                            try:
-                                if hasattr(ws, 'transport') and ws.transport:
-                                    ws.transport.close()
-                                    logger.info(f"✅ {label} [{tname}] Transport hard closed.")
-                            except Exception as transport_err:
-                                logger.error(f"🚨 {label} [{tname}] Transport close error: {transport_err}")
-                            
-                            # 3. Wait for new socket to connect
-                            reconnected = False
-                            for wait_idx in range(40):  # max 4 seconds
-                                time.sleep(0.1)
-                                current_ws = acct.tables.get(token, {}).get('ws')
-                                if current_ws and current_ws != ws:
-                                    logger.info(f"✅ {label} [{tname}] Reconnection detected! Proceeding to retry UNDO on fresh socket...")
-                                    reconnected = True
-                                    break
-                            if not reconnected:
-                                logger.warning(f"⚠️ {label} [{tname}] Reconnection timed out (4s), retrying on whatever is available...")
-
-                    fut = asyncio.run_coroutine_threadsafe(
-                        acct._undo_bets_async([token], bet_type=undo_bet_type, amount=bet_amt),
-                        acct.loop
-                    )
-                    fut.result(timeout=3)
-                    logger.info(f"✅ {label} UNDO sent on '{tname}' (attempt {attempt+1})")
-                    time.sleep(0.15)
-                    acct.update_balance()
-                    
-                    if acct.balance >= expected_bal - 0.5:
-                        logger.info(f"✅ {label} UNDO VERIFIED: Rs. {acct.balance:.2f}")
-                        acct.pending_bet_acks[token] = {'status': 'undone', 'raw': 'Verified'}
-                        return
-                    else:
-                        logger.warning(f"🚨 {label} UNDO verification failed: bal={acct.balance:.2f} expected={expected_bal:.2f}")
-                        time.sleep(0.1)
-                except Exception as e:
-                    logger.error(f"🚨 {label} UNDO attempt {attempt+1} FAILED: {e}")
-                    time.sleep(0.15)
-
-            # Standard undo failed 3x — log warning, but do NOT close WebSocket
-            # Once window is closed, closing the socket does not cancel the bet on the server anyway.
-            err = f"🚨 CRITICAL: {label} UNDO FAILED on '{tname}' after 3 attempts!"
-            logger.error(err)
-            if self.telegram:
-                self.telegram.send_message(err)
-
-        t1 = threading.Thread(target=_undo_one_account, args=(acc1, "Acc1 (Andar)", acc1.bet_type, bal1_bef), daemon=True)
-        t2 = threading.Thread(target=_undo_one_account, args=(acc2, "Acc2 (Bahar)", acc2.bet_type, bal2_bef), daemon=True)
-        t1.start()
-        t2.start()
-        t1.join(timeout=6)
-        t2.join(timeout=6)
 
     async def _track_bet_result(self, table_names, bal1_before, bal2_before):
         await asyncio.sleep(45)
