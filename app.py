@@ -593,6 +593,14 @@ def login():
     result = coordinator.perform_login(base_url, user1, pass1, user2, pass2)
     return jsonify(result)
 
+@app.route('/api/logout', methods=['POST'])
+def logout():
+    coordinator = get_coordinator()
+    if not coordinator:
+        return jsonify({"success": False, "message": "Missing X-Session-ID header"}), 400
+    result = coordinator.logout_all()
+    return jsonify(result)
+
 @app.route('/api/login_status', methods=['GET'])
 def get_login_status():
     coordinator = get_coordinator()
@@ -632,15 +640,6 @@ def disarm_bet():
         return jsonify({"error": "Missing X-Session-ID header"}), 400
         
     result = coordinator.disarm_auto_bet()
-    return jsonify(result)
-
-@app.route('/api/undo', methods=['POST'])
-def manual_undo():
-    coordinator = get_coordinator()
-    if not coordinator:
-        return jsonify({"error": "Missing X-Session-ID header"}), 400
-        
-    result = coordinator.manual_undo_bets()
     return jsonify(result)
 
 @app.route('/api/test_stack', methods=['POST'])

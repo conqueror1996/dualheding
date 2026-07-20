@@ -1126,11 +1126,55 @@ class BaccaratManager:
         
     def stop(self):
         self.running = False
-        if self.loop:
-            for task in list(self.active_tasks):  # snapshot set before iteration
-                self.loop.call_soon_threadsafe(task.cancel)
+        
+        # 1. Close all raw TCP/WS sockets immediately to prevent ghost background messages
+        for token, info in list(self.tables.items()):
+            ws = info.get('ws')
+            if ws:
+                try:
+                    transport = getattr(ws, 'transport', None)
+                    if transport:
+                        transport.close()
+                except Exception:
+                    pass
+                if self.loop and self.loop.is_running():
+                    try:
+                        self.loop.call_soon_threadsafe(lambda w=ws: asyncio.create_task(w.close()))
+                    except Exception:
+                        pass
+            info['ws'] = None
+            info['status'] = "Disconnected"
+            info['is_betting_open'] = False
+
+        # 2. Cancel all active asyncio tasks in loop
+        if self.loop and self.loop.is_running():
+            for task in list(self.active_tasks):
+                try:
+                    self.loop.call_soon_threadsafe(task.cancel)
+                except Exception:
+                    pass
+            try:
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            except Exception:
+                pass
+
         self.active_tasks.clear()
-        # Don't clear tables here; running WS tasks still reference them
+        
+        # 3. Close HTTP session
+        if self.playcric_session:
+            try:
+                self.playcric_session.close()
+            except Exception:
+                pass
+            self.playcric_session = None
+
+        # 4. Wipe stored tables, tokens and credentials clean
+        self.tables.clear()
+        self.csrf_token = None
+        self.player_token = None
+        self.operator_token = None
+        self._username = None
+        self._password = None
     def _prebuild_bet_frames(self, game_token):
         """Pre-build raw WebSocket frames for both bet types when betting opens.
         Warms JIT code path. Actual amount is replaced at fire time in <1ms."""
@@ -1361,11 +1405,34 @@ class GlobalCoordinator:
         self.telegram = TelegramBotManager(self)
         self.telegram.start()
         
+    def logout_all(self):
+        """Completely stop and kill all WebSocket connections, tasks, HTTP sessions,
+        stored credentials, hunter loop, and purge memory clean."""
+        self.disarm_auto_bet()
+        for mgr in [getattr(self, 'account1', None), getattr(self, 'account2', None)]:
+            if mgr:
+                try:
+                    mgr.stop()
+                except Exception:
+                    pass
+        
+        self.auto_bet_requested = False
+        self.bet_state = "idle"
+        self.last_bet_result = None
+        self._hedge_undone = False
+        self.bet_history.clear()
+        self.burned_account = None
+        self._burn_detected_at = None
+        self.initial_balance1 = 0.0
+        self.initial_balance2 = 0.0
+        
+        gc.collect()
+        logger.info("🧹 LOGOUT COMPLETE: All WS connections, tasks, sessions, and garbage purged clean.")
+        return {"success": True, "message": "Logged out and all background connections/garbage cleared."}
+
     def perform_login(self, base_url, user1, pass1, user2, pass2):
-        # Stop existing background tasks to prevent ghost connections
-        for mgr in [self.account1, self.account2]:
-            if mgr.running:
-                mgr.stop()
+        # Stop and kill all existing background connections, tasks and sessions completely
+        self.logout_all()
 
         # Force garbage collect old WS objects, frame buffers, cached data
         gc.collect()
