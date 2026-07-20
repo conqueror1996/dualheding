@@ -1718,90 +1718,41 @@ class GlobalCoordinator:
                     return bytes(frame)
                 
                 try:
-                    # ── PHASE 1: PRE-BUILD ALL 4 FRAMES (zero delay during fire) ──
-                    frames = {}  # (tok, acc_key) → (transport, frame)
-                    all_transports_ok = True
+                    # ── CLEAN ASYNC FIRE (ws.send via asyncio threadsafe) ──
+                    # Fires all 4 bets concurrently through standard websockets ws.send()
+                    futures = []
                     
+                    async def _send_bet_coro(ws_obj, payload_str):
+                        await ws_obj.send(payload_str)
+
+                    # Queue Acc1 bets first, then Acc2 bets
                     for tok, info in tables:
                         tname = info.get('name', tok[:8])
                         ws1 = acc1.tables.get(tok, {}).get('ws')
                         ws2 = acc2.tables.get(tok, {}).get('ws')
-                        t1 = getattr(ws1, 'transport', None) if ws1 else None
-                        t2 = getattr(ws2, 'transport', None) if ws2 else None
-                        
-                        if t1 and t2:
-                            frames[(tok, 'acc1')] = (t1, _build_ws_frame(bet_payloads[(tok, 'acc1')]))
-                            frames[(tok, 'acc2')] = (t2, _build_ws_frame(bet_payloads[(tok, 'acc2')]))
-                        else:
-                            logger.warning(f"⚠️ [{tname}] Missing transport: t1={t1 is not None}, t2={t2 is not None}")
-                            all_transports_ok = False
-                    
-                    if all_transports_ok and len(frames) == expected_jobs:
-                        # ── PHASE 2: FIRE IN PER-ACCOUNT ORDER (THREAD-SAFE) ──
-                        # Each account's event loop runs in its OWN thread.
-                        # transport.write() MUST be called from the event loop thread.
-                        # Solution: batch all writes for one account into ONE call_soon_threadsafe
-                        # → Only 2 scheduling calls (1 per account) instead of 4
-                        # → Within each callback, both table writes execute back-to-back
-                        #   in the SAME event loop iteration (~0.005ms apart)
-                        
-                        table_tokens = [tok for tok, _ in tables]
-                        table_names = {tok: info.get('name', tok[:8]) for tok, info in tables}
-                        
-                        # Build batch-write closures
-                        acc1_writes = [(frames[(tok, 'acc1')]) for tok in table_tokens]
-                        acc2_writes = [(frames[(tok, 'acc2')]) for tok in table_tokens]
-                        
-                        def _blast_acc1():
-                            for transport, frame in acc1_writes:
-                                transport.write(frame)
-                        
-                        def _blast_acc2():
-                            for transport, frame in acc2_writes:
-                                transport.write(frame)
-                        
-                        # Schedule both blasts — they fire on next event loop tick
-                        # Acc1 fires first, Acc2 fires microseconds later
-                        acc1.loop.call_soon_threadsafe(_blast_acc1)
-                        acc2.loop.call_soon_threadsafe(_blast_acc2)
-                        
-                        total_jobs = expected_jobs
-                        for tok in table_tokens:
-                            tname = table_names[tok]
-                            fire_details.append({'table': tname, 'account': 'Acc1', 'ok': True, 'method': 'batch_threadsafe'})
-                            fire_details.append({'table': tname, 'account': 'Acc2', 'ok': True, 'method': 'batch_threadsafe'})
-                        
-                        logger.info(f"⚡ PER-ACCOUNT BLAST: Acc1→[{','.join(table_names[t] for t in table_tokens)}] then Acc2→[{','.join(table_names[t] for t in table_tokens)}] via batch_threadsafe")
-                    
-                    else:
-                        # FALLBACK: ws.send() through asyncio (slower but safe)
-                        logger.warning(f"⚠️ Falling back to ws.send() for {len(tables)} tables")
-                        for tok, info in tables:
-                            tname = info.get('name', tok[:8])
-                            ws1 = acc1.tables.get(tok, {}).get('ws')
-                            ws2 = acc2.tables.get(tok, {}).get('ws')
-                            p1 = bet_payloads[(tok, 'acc1')]
-                            p2 = bet_payloads[(tok, 'acc2')]
-                            futures = []
-                            
-                            async def _send_bet(ws_obj, payload_str):
-                                await ws_obj.send(payload_str)
-                            
-                            if ws1 and acc1.loop:
-                                fut1 = asyncio.run_coroutine_threadsafe(_send_bet(ws1, p1), acc1.loop)
-                                futures.append((fut1, f"Acc1-{tname}"))
-                            if ws2 and acc2.loop:
-                                fut2 = asyncio.run_coroutine_threadsafe(_send_bet(ws2, p2), acc2.loop)
-                                futures.append((fut2, f"Acc2-{tname}"))
-                            
-                            for fut, label in futures:
-                                try:
-                                    fut.result(timeout=2.0)
-                                    total_jobs += 1
-                                    fire_details.append({'table': tname, 'account': label.split('-')[0], 'ok': True, 'method': 'ws.send'})
-                                except Exception as e:
-                                    logger.error(f"⚡ Send failed for {label}: {e}")
-                                    send_failed = True
+                        p1 = bet_payloads.get((tok, 'acc1'))
+                        p2 = bet_payloads.get((tok, 'acc2'))
+
+                        if ws1 and acc1.loop and p1:
+                            fut1 = asyncio.run_coroutine_threadsafe(_send_bet_coro(ws1, p1), acc1.loop)
+                            futures.append((fut1, f"Acc1-{tname}"))
+                        if ws2 and acc2.loop and p2:
+                            fut2 = asyncio.run_coroutine_threadsafe(_send_bet_coro(ws2, p2), acc2.loop)
+                            futures.append((fut2, f"Acc2-{tname}"))
+
+                    # Wait for all 4 sends to complete
+                    for fut, label in futures:
+                        try:
+                            fut.result(timeout=2.0)
+                            total_jobs += 1
+                            fire_details.append({'table': label.split('-')[1], 'account': label.split('-')[0], 'ok': True, 'method': 'ws.send'})
+                        except Exception as e:
+                            logger.error(f"⚡ Send failed for {label}: {e}")
+                            send_failed = True
+                
+                except Exception as e:
+                    logger.error(f"⚡ Firing execution failed: {e}")
+                    send_failed = True
                 
                 except Exception as e:
                     logger.error(f"⚡ Firing blast execution failed: {e}")
