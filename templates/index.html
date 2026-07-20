@@ -2612,24 +2612,28 @@
                     
                     if (!hasConnectedTables) {
                         netSignal.className = 'network-signal-container disconnected';
-                        netLatencyVal.innerText = '-- ms';
+                        netLatencyVal.innerText = 'offline';
                         netSignal.title = 'Disconnected';
                     } else {
                         const latVal = Math.round(lat);
-                        netLatencyVal.innerText = `${latVal} ms`;
-                        netSignal.title = `Latency: ${latVal} ms`;
                         
                         if (latVal <= 0) {
-                            netSignal.className = 'network-signal-container disconnected';
-                            netLatencyVal.innerText = 'offline';
-                        } else if (latVal <= 80) {
                             netSignal.className = 'network-signal-container excellent';
-                        } else if (latVal <= 150) {
-                            netSignal.className = 'network-signal-container good';
-                        } else if (latVal <= 250) {
-                            netSignal.className = 'network-signal-container fair';
+                            netLatencyVal.innerText = 'online';
+                            netSignal.title = 'Connected';
                         } else {
-                            netSignal.className = 'network-signal-container poor';
+                            netLatencyVal.innerText = `${latVal} ms`;
+                            netSignal.title = `Latency: ${latVal} ms`;
+                            
+                            if (latVal <= 80) {
+                                netSignal.className = 'network-signal-container excellent';
+                            } else if (latVal <= 150) {
+                                netSignal.className = 'network-signal-container good';
+                            } else if (latVal <= 250) {
+                                netSignal.className = 'network-signal-container fair';
+                            } else {
+                                netSignal.className = 'network-signal-container poor';
+                            }
                         }
                     }
                 }
