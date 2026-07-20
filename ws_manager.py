@@ -633,8 +633,8 @@ class BaccaratManager:
                 additional_headers={"Origin": origin},
                 open_timeout=15,   # If handshake hangs (proxy drop), raise after 15s
                 close_timeout=5,   # Don't wait forever on graceful close
-                ping_interval=8,   # Send WS-level ping every 8s (detect dead connection fast)
-                ping_timeout=5,    # Close connection if pong not received within 5s
+                ping_interval=30,  # Send WS-level ping every 30s
+                ping_timeout=20,   # Allow 20s for pong response over proxy
             ) as ws:
                 if game_token not in self.tables:
                     return
@@ -1011,9 +1011,9 @@ class BaccaratManager:
             self._coordinator_ref.check_auto_bet()
 
     async def _heartbeat_loop(self):
-        # Andar Bahar has natural 7-12s silence between rounds (result → new round).
-        # Old 8s timeout caused false zombie detection. 25s safely covers worst-case gaps.
-        SILENCE_TIMEOUT = 25
+        # Andar Bahar has natural 7-45s silence between rounds (result → card shuffle → new round).
+        # Old 25s timeout caused false zombie detection. 60s safely covers worst-case gaps.
+        SILENCE_TIMEOUT = 60
         while self.running:
             # Snapshot to avoid dict-changed-size-during-iteration errors
             items = list(self.tables.items())
@@ -1027,7 +1027,7 @@ class BaccaratManager:
                     except Exception as e:
                         logger.debug(f"[{self.name}] Heartbeat send failed for {info.get('name', token[:8])}: {e}")
 
-                    # 2. Silence watchdog: if WS reports open but no messages for 25s, force-close
+                    # 2. Silence watchdog: if WS reports open but no messages for 60s, force-close
                     last_msg = info.get('last_msg_at', 0)
                     if last_msg > 0 and (now - last_msg) > SILENCE_TIMEOUT:
                         tname = info.get('name', token[:8])
@@ -1039,7 +1039,7 @@ class BaccaratManager:
                             await ws.close()
                         except Exception:
                             pass
-            await asyncio.sleep(1)  # Heartbeat every 1s — ultra-fast zombie detection
+            await asyncio.sleep(5)  # Heartbeat every 5s (SignalR standard is 15s)
 
     async def _balance_loop(self):
         """Balance loop — runs blocking HTTP in thread executor to not block event loop."""
@@ -1048,15 +1048,14 @@ class BaccaratManager:
             try:
                 await loop.run_in_executor(_executor, self.update_balance)
             except Exception as e:
-                logger.debug(f"[{self.name}] Balance loop error: {e}")
-            await asyncio.sleep(5)
+                logger.warning(f"[{self.name}] Balance update error: {e}")
+            await asyncio.sleep(15)  # Fetch balance every 15s
 
     async def _betting_expiry_loop(self):
-        """Auto-expire stale is_betting_open states to prevent betting on closed windows."""
+        """Check for expired betting windows and reset status."""
         while self.running:
             now = time.time()
-            items = list(self.tables.items())
-            for token, info in items:
+            for token, info in list(self.tables.items()):
                 if info.get('is_betting_open'):
                     elapsed = now - info.get('betting_opened_at', 0)
                     if elapsed > BETTING_OPEN_TIMEOUT:
@@ -1073,7 +1072,7 @@ class BaccaratManager:
             try:
                 start_time = time.time()
                 pong_waiter = await ws.ping()
-                await asyncio.wait_for(pong_waiter, timeout=4.0)
+                await asyncio.wait_for(pong_waiter, timeout=8.0)
                 latency_ms = (time.time() - start_time) * 1000
                 consecutive_failures = 0
                 if game_token in self.tables:
@@ -1089,14 +1088,24 @@ class BaccaratManager:
                     self.tables[game_token]['latency'] = -1
                 tname = self.tables[game_token].get('name', game_token[:8]) if game_token in self.tables else game_token[:8]
                 logger.warning(f"[{self.name}] [{tname}] ⚠️ Ping failed ({consecutive_failures}/3): {e}")
+                
+                # IMPORTANT: Only close if connection is ALSO silent (no game data received recently)
+                # If game messages are still flowing, pong failure is just proxy dropping WS ping frames.
+                last_msg = self.tables.get(game_token, {}).get('last_msg_at', 0)
+                is_actively_receiving = (time.time() - last_msg) < 15.0
+                
                 if consecutive_failures >= 3:
-                    logger.error(f"[{self.name}] [{tname}] 🚨 WebSocket zombie connection detected (3 consecutive ping failures). Force closing.")
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
-                    break
-            await asyncio.sleep(2)  # Latency ping every 2s — fast health monitoring
+                    if is_actively_receiving:
+                        logger.warning(f"[{self.name}] [{tname}] ℹ️ Ping timed out 3x but game messages are active. Keeping connection alive.")
+                        consecutive_failures = 0  # Reset counter
+                    else:
+                        logger.error(f"[{self.name}] [{tname}] 🚨 WebSocket zombie connection detected (3 ping failures & 15s silence). Force closing.")
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        break
+            await asyncio.sleep(10)  # Measure latency every 10s instead of 2s
 
     async def start_all_tables_async(self):
         self.running = True
@@ -1728,31 +1737,41 @@ class GlobalCoordinator:
                             all_transports_ok = False
                     
                     if all_transports_ok and len(frames) == expected_jobs:
-                        # ── PHASE 2: FIRE IN PER-ACCOUNT ORDER ──
-                        # Acc1 on ALL tables first (back-to-back, ~0.01ms apart)
-                        # Then Acc2 on ALL tables (back-to-back, ~0.01ms apart)
-                        # This creates the widest race window for each account's duplicate bets
+                        # ── PHASE 2: FIRE IN PER-ACCOUNT ORDER (THREAD-SAFE) ──
+                        # Each account's event loop runs in its OWN thread.
+                        # transport.write() MUST be called from the event loop thread.
+                        # Solution: batch all writes for one account into ONE call_soon_threadsafe
+                        # → Only 2 scheduling calls (1 per account) instead of 4
+                        # → Within each callback, both table writes execute back-to-back
+                        #   in the SAME event loop iteration (~0.005ms apart)
                         
                         table_tokens = [tok for tok, _ in tables]
                         table_names = {tok: info.get('name', tok[:8]) for tok, info in tables}
                         
-                        # ──── BLAST ACC1 on both tables ────
-                        for tok in table_tokens:
-                            transport, frame = frames[(tok, 'acc1')]
-                            transport.write(frame)  # Direct write, no call_soon_threadsafe
+                        # Build batch-write closures
+                        acc1_writes = [(frames[(tok, 'acc1')]) for tok in table_tokens]
+                        acc2_writes = [(frames[(tok, 'acc2')]) for tok in table_tokens]
                         
-                        # ──── BLAST ACC2 on both tables (microseconds later) ────
-                        for tok in table_tokens:
-                            transport, frame = frames[(tok, 'acc2')]
-                            transport.write(frame)  # Direct write, no call_soon_threadsafe
+                        def _blast_acc1():
+                            for transport, frame in acc1_writes:
+                                transport.write(frame)
+                        
+                        def _blast_acc2():
+                            for transport, frame in acc2_writes:
+                                transport.write(frame)
+                        
+                        # Schedule both blasts — they fire on next event loop tick
+                        # Acc1 fires first, Acc2 fires microseconds later
+                        acc1.loop.call_soon_threadsafe(_blast_acc1)
+                        acc2.loop.call_soon_threadsafe(_blast_acc2)
                         
                         total_jobs = expected_jobs
                         for tok in table_tokens:
                             tname = table_names[tok]
-                            fire_details.append({'table': tname, 'account': 'Acc1', 'ok': True, 'method': 'transport.write_direct'})
-                            fire_details.append({'table': tname, 'account': 'Acc2', 'ok': True, 'method': 'transport.write_direct'})
+                            fire_details.append({'table': tname, 'account': 'Acc1', 'ok': True, 'method': 'batch_threadsafe'})
+                            fire_details.append({'table': tname, 'account': 'Acc2', 'ok': True, 'method': 'batch_threadsafe'})
                         
-                        logger.info(f"⚡ PER-ACCOUNT BLAST: Acc1→[{','.join(table_names[t] for t in table_tokens)}] then Acc2→[{','.join(table_names[t] for t in table_tokens)}] via direct transport.write()")
+                        logger.info(f"⚡ PER-ACCOUNT BLAST: Acc1→[{','.join(table_names[t] for t in table_tokens)}] then Acc2→[{','.join(table_names[t] for t in table_tokens)}] via batch_threadsafe")
                     
                     else:
                         # FALLBACK: ws.send() through asyncio (slower but safe)
