@@ -14,12 +14,12 @@ def deploy_to_vps():
     client.connect(host, port=port, username=username, password=password)
     
     commands = [
-        "rm -rf /root/dualhedge",
-        "git clone https://github.com/conqueror1996/dualheding.git /root/dualhedge",
+        "mkdir -p /root/dualhedge",
         "cd /root/dualhedge",
+        "if [ ! -d .git ]; then git clone https://github.com/conqueror1996/DUALHEDGE.git .; else git fetch --all && git reset --hard origin/main; fi",
         "apt-get update && apt-get install -y python3-pip python3-venv",
-        "/usr/bin/python3 -m venv /root/dualhedge/venv",
-        "/root/dualhedge/venv/bin/pip install -r /root/dualhedge/requirements.txt",
+        "if [ ! -d venv ]; then python3 -m venv venv; fi",
+        "source venv/bin/activate && pip install -r requirements.txt",
         "cat << 'SERVICE' > /etc/systemd/system/dualhedge.service\n[Unit]\nDescription=DualHedge Baccarat Bot\nAfter=network.target\n\n[Service]\nUser=root\nWorkingDirectory=/root/dualhedge\nExecStart=/root/dualhedge/venv/bin/python3 app.py\nRestart=always\nRestartSec=3\nEnvironment=\"PATH=/root/dualhedge/venv/bin\"\n\n[Install]\nWantedBy=multi-user.target\nSERVICE",
         "systemctl daemon-reload",
         "systemctl enable dualhedge",

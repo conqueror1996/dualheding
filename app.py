@@ -286,6 +286,22 @@ def cleanup_stale_sessions():
 
 threading.Thread(target=cleanup_stale_sessions, daemon=True).start()
 
+@app.route('/api/debug_active_sessions', methods=['GET'])
+def debug_active_sessions():
+    out = {}
+    for sid, data in active_sessions.items():
+        coord = data['coordinator']
+        out[sid] = {
+            "last_active": data['last_active'],
+            "acc1_tables": list(coord.account1.tables.keys()),
+            "acc2_tables": list(coord.account2.tables.keys()),
+            "acc1_login_status": coord.account1.login_status,
+            "acc2_login_status": coord.account2.login_status,
+            "acc1_running": coord.account1.running,
+            "acc2_running": coord.account2.running
+        }
+    return jsonify(out)
+
 
 @app.route('/')
 def index():
@@ -441,7 +457,7 @@ def status():
         guidance = {"icon": "⏳", "text": "Wait karo...", "color": "#95a5a6"}
 
     return jsonify({
-        # ── Baccarat tables ──
+        # ── Andar Bahar tables ──
         "tables1": [
             {
                 "token": t, "name": info["name"],
@@ -464,7 +480,7 @@ def status():
                 "frame_ready": info.get("frame_ready", False)
             } for t, info in tables2_snap.items()
         ],
-        # ── Baccarat ──
+        # ── Andar Bahar ──
         "balance1": coordinator.account1.balance,
         "balance2": coordinator.account2.balance,
         "initial_balance1": coordinator.initial_balance1,
@@ -475,6 +491,8 @@ def status():
         "auto_bet_armed": coordinator.auto_bet_requested,
         "login_status1": coordinator.account1.login_status,
         "login_status2": coordinator.account2.login_status,
+        "nickname1": getattr(coordinator.account1, 'temp_nickname', ''),
+        "nickname2": getattr(coordinator.account2, 'temp_nickname', ''),
         "round_results1": coordinator.account1.round_results[-20:],
         "round_results2": coordinator.account2.round_results[-20:],
         "burned_account": coordinator.burned_account,
@@ -634,19 +652,19 @@ def clear_cache():
     if not coordinator:
         return jsonify({"error": "Missing X-Session-ID header"}), 400
 
-    # Clear baccarat round results and acks
+    # Clear Andar Bahar round results and acks
     coordinator.account1.round_results.clear()
     coordinator.account2.round_results.clear()
     coordinator.account1.pending_bet_acks.clear()
     coordinator.account2.pending_bet_acks.clear()
 
-    # Clear last_result from each baccarat table
+    # Clear last_result from each Andar Bahar table
     for info in coordinator.account1.tables.values():
         info.pop('last_result', None)
     for info in coordinator.account2.tables.values():
         info.pop('last_result', None)
 
-    # Reset baccarat bet state
+    # Reset Andar Bahar bet state
     coordinator.last_bet_result   = None
     coordinator.bet_state         = "idle"
     coordinator.auto_bet_requested = False
@@ -687,7 +705,15 @@ def get_logs():
     from ws_manager import LOG_BUFFER
     return "\n".join(list(LOG_BUFFER)), 200, {'Content-Type': 'text/plain; charset=utf-8'}
 
+@app.route('/api/js_error', methods=['POST'])
+def js_error():
+    data = request.json or {}
+    msg = data.get('message', 'Unknown')
+    stack = data.get('stack', '')
+    logger.error(f"🚨 CLIENT JS ERROR: {msg}\nStack: {stack}")
+    return jsonify({"success": True})
+
 if __name__ == '__main__':
     import os
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5001))
     app.run(host='0.0.0.0', port=port, threaded=True, debug=False)

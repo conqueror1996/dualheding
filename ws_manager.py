@@ -146,12 +146,17 @@ class TelegramBotManager:
 
 
 class BaccaratManager:
-    # Map winner codes to labels
-    WINNER_MAP = {0: 'Player', 1: 'Banker', 2: 'Tie', 'player': 'Player', 'banker': 'Banker', 'tie': 'Tie'}
+    # Map winner codes to labels (Andar Bahar: 0=Andar, 1=Bahar)
+    WINNER_MAP = {0: 'Andar', 1: 'Bahar', 2: 'Tie', 'andar': 'Andar', 'bahar': 'Bahar', 'tie': 'Tie', 'player': 'Andar', 'banker': 'Bahar'}
 
     def __init__(self, name, bet_type):
         self.name    = name
         self.bet_type = bet_type
+        import random
+        import string
+        prefix = random.choice(["Player", "User", "Gamer", "Pro", "sasa", "pagal", "robin", "terrence", "brenda", "sam", "max", "lucky"])
+        suffix = "".join(random.choices(string.digits, k=6))
+        self.temp_nickname = f"{prefix}{suffix}"
         self.tables  = {}  # token -> {name, status, is_betting_open, ws, ...}
         self.balance = 0
         self.running = False
@@ -261,7 +266,22 @@ class BaccaratManager:
                         logger.error(f"[{self.name}] CSRF extraction failed on backup proxy (HTTP {status}). URL: {url_used}. Body snippet: {resp.text[:300]}")
                         return {"success": False, "message": f"Failed to extract CSRF token after proxy failover. (HTTP {status})"}
                 except Exception as retry_err:
-                    return {"success": False, "message": f"Connection error after proxy failover: {retry_err}"}
+                    logger.warning(f"[{self.name}] Proxy failover SSL error ({retry_err}). Falling back to direct connection...")
+                    self.playcric_session.proxies = {}  # Fallback to direct connection if proxy fails
+                    try:
+                        resp = self.playcric_session.get(self.playcric_url, timeout=15)
+                        soup = BeautifulSoup(resp.text, 'html.parser')
+                        token_input = soup.find('input', {'name': '_token'})
+                        if token_input:
+                            self.csrf_token = token_input.get('value')
+                        else:
+                            meta_token = soup.find('meta', {'name': 'csrf-token'})
+                            if meta_token:
+                                self.csrf_token = meta_token.get('content')
+                        if not self.csrf_token:
+                            return {"success": False, "message": "Failed to extract CSRF token (direct connection)."}
+                    except Exception as direct_err:
+                        return {"success": False, "message": f"Connection error after retry: {direct_err}"}
             else:
                 status = getattr(locals().get('resp'), 'status_code', '?')
                 logger.error(f"[{self.name}] Connection/CSRF error: {e}. HTTP Status: {status}")
@@ -382,15 +402,13 @@ class BaccaratManager:
             resp = requests.get(url, headers=headers, proxies=proxies, timeout=10)
             if resp.status_code == 200:
                 games = resp.json()
-                # Match baccarat games by name (case-insensitive), sort alphabetically, and limit to 4 tables
-                all_bacc = [g for g in games if 'baccarat' in g.get('name', '').lower()]
-                all_bacc.sort(key=lambda g: g.get('name', '').lower())
-                logger.info(f"[{self.name}] All available baccarat games sorted: {[g.get('name') for g in all_bacc]}")
-                baccarat_games = all_bacc[:4]
-                logger.info(f"[{self.name}] Selected 4 baccarat tables: {[g.get('name') for g in baccarat_games]}")
-                if len(baccarat_games) > 0:
-                    logger.info(f"[{self.name}] Sample Baccarat Game JSON: {baccarat_games[0]}")
-                for g in baccarat_games:
+                # Match Andar Bahar twin tables by exact token (ab-3, ab-4)
+                ab_games = [g for g in games if g.get('token') in config.ANDAR_BAHAR_TOKENS]
+                ab_games.sort(key=lambda g: g.get('token', ''))
+                logger.info(f"[{self.name}] Andar Bahar twin tables found: {[g.get('name') for g in ab_games]}")
+                if len(ab_games) > 0:
+                    logger.info(f"[{self.name}] Sample Andar Bahar Game JSON: {ab_games[0]}")
+                for g in ab_games:
                     token = g.get('token')
                     if token and token not in self.tables:
                         self.tables[token] = {
@@ -660,6 +678,20 @@ class BaccaratManager:
                     BaccaratManager._log_raw_frame("-->", self.name, game_token, '{"arguments":[],"invocationId":"0","target":"Ready","type":1}\x1e')
                     await ws.send('{"arguments":[],"invocationId":"0","target":"Ready","type":1}\x1e')
                     
+                    # 🔒 Nickname Obfuscation: Send random pregenerated nickname
+                    nickname_payload = {
+                        "arguments": [{
+                            "type": 11,
+                            "data": json.dumps({"nickname": self.temp_nickname})
+                        }],
+                        "target": "Message",
+                        "type": 1
+                    }
+                    nickname_frame = json.dumps(nickname_payload) + "\x1e"
+                    BaccaratManager._log_raw_frame("-->", self.name, game_token, nickname_frame)
+                    await ws.send(nickname_frame)
+                    logger.info(f"[{self.name}] Sent nickname obfuscation frame: {self.temp_nickname}")
+                    
                     async for message in ws:
                         if not self.running:
                             break
@@ -697,6 +729,27 @@ class BaccaratManager:
             return
         # Update last-message timestamp on every received WS message (silence watchdog)
         self.tables[game_token]['last_msg_at'] = time.time()
+
+        # ── SignalR Completion Message (type: 3) — Bet Confirmation ──
+        # In Andar Bahar, type:3 with result:null and no error IS the only
+        # bet confirmation 7Mojos sends. There is no separate inner_type
+        # game-engine confirmation for AB (unlike Baccarat).
+        if data.get('type') == 3:
+            tname = self.tables[game_token].get('name', game_token[:8])
+            error_info = data.get('error')
+            if error_info:
+                if game_token in self.pending_bet_acks and self.pending_bet_acks[game_token]['status'] == 'pending':
+                    self.pending_bet_acks[game_token]['status'] = 'rejected'
+                    self.pending_bet_acks[game_token]['raw'] = str(error_info)[:200]
+                logger.warning(f"[{self.name}] [{tname}] ❌ SignalR invocation error: {error_info}")
+            else:
+                if game_token in self.pending_bet_acks and self.pending_bet_acks[game_token]['status'] == 'pending':
+                    self.pending_bet_acks[game_token]['status'] = 'confirmed'
+                    self.pending_bet_acks[game_token]['raw'] = 'SignalR type:3 completion ACK'
+                    logger.info(f"[{self.name}] [{tname}] 🎉 BET CONFIRMED (SignalR type:3 ACK)")
+                else:
+                    logger.debug(f"[{self.name}] [{tname}] 📩 SignalR type:3 ACK (no pending bet)")
+
         if data.get('type') == 1 and data.get('target') == 'Message':
             args = data.get('arguments', [])
             if args and len(args) > 0:
@@ -710,122 +763,105 @@ class BaccaratManager:
                         tname = self.tables[game_token].get('name', game_token[:8])
                         logger.debug(f"[{self.name}] [{tname}] WS msg_type={msg_type} data_keys={list(payload.get('data', {}).keys()) if isinstance(payload.get('data'), dict) else payload.get('type', '?')}")
 
+                        # Process all message types for bet confirmation and roundId updates
                         if msg_type == 2:
                             inner_data = payload.get('data', {})
-                            inner_type = inner_data.get('type')
-                            logger.debug(f"[{self.name}] [{tname}] type=2 inner_type={inner_type} keys={list(inner_data.keys())}")
+                            if isinstance(inner_data, str):
+                                try:
+                                    inner_data = json.loads(inner_data)
+                                except Exception:
+                                    inner_data = {}
+                            inner_type = inner_data.get('type') if isinstance(inner_data, dict) else None
+                            # Log at INFO level when bet is pending so we can debug confirmation
+                            if game_token in self.pending_bet_acks and self.pending_bet_acks[game_token]['status'] == 'pending':
+                                logger.info(f"[{self.name}] [{tname}] 🔍 BET PENDING — got msg inner_type={inner_type} keys={list(inner_data.keys()) if isinstance(inner_data, dict) else 'none'}")
+                            else:
+                                logger.debug(f"[{self.name}] [{tname}] type=2 inner_type={inner_type}")
                             if inner_type == 3:
                                 self.tables[game_token]['status'] = "Betting Open"
                                 self.tables[game_token]['is_betting_open'] = True
                                 self.tables[game_token]['betting_opened_at'] = time.time()
-                                # 🚀 PRE-BUILD raw WS frames for BOTH bet types (Player & Banker)
                                 self._prebuild_bet_frames(game_token)
                                 self._on_betting_open()
                             elif inner_type == 7:
                                 self.tables[game_token]['status'] = "Dealing"
                                 self.tables[game_token]['is_betting_open'] = False
                                 self.tables[game_token]['frame_ready'] = False
+                            elif inner_type == 1:
+                                # inner_type:1 = game state update (may contain bet info)
+                                if game_token in self.pending_bet_acks:
+                                    if self.pending_bet_acks[game_token]['status'] == 'pending':
+                                        self.pending_bet_acks[game_token]['status'] = 'confirmed'
+                                        self.pending_bet_acks[game_token]['raw'] = str(inner_data)[:200]
+                                        logger.info(f"[{self.name}] [{tname}] 🎉 BET CONFIRMED by game engine (inner_type=1)")
+                            # NOTE: inner_type:6 = Bahar card dealt, inner_type:7 = Andar card dealt
+                            # These are NOT bet result messages in Andar Bahar!
                             elif inner_type == 0:
                                 self.tables[game_token]['roundId'] = inner_data.get('roundId')
-                                # Extract and log config details
-                                config_dict = inner_data.get('config', {})
                                 currency_dict = inner_data.get('currencyConfig', {})
-                                
-                                # Extract min/max bet from currencyConfig
                                 if isinstance(currency_dict, dict):
                                     if 'maxBet' in currency_dict:
                                         self.tables[game_token]['max_bet'] = float(currency_dict['maxBet'])
                                     if 'minBet' in currency_dict:
                                         self.tables[game_token]['min_bet'] = float(currency_dict['minBet'])
-                                    
                                 logger.info(
                                     f"[{self.name}] [{tname}] Table limits parsed — "
                                     f"Min: {self.tables[game_token].get('min_bet', 50.0):.2f} | "
                                     f"Max: {self.tables[game_token].get('max_bet', 100.0):.2f}"
                                 )
-                                import os
-                                try:
-                                    os.makedirs("/Users/urbanclay/Desktop/7mojo_dual_hedge_final/scratch", exist_ok=True)
-                                    with open("/Users/urbanclay/Desktop/7mojo_dual_hedge_final/scratch/table_init.json", "w") as f_init:
-                                        json.dump(inner_data, f_init, indent=4)
-                                except Exception as e:
-                                    pass
 
-                            # ── Universal roundId sync ──
-                            # Update roundId from ANY inner_data that carries it
-                            # (not just inner_type=0). This prevents stale roundId
-                            # when account misses the new-round init message.
-                            incoming_rid = inner_data.get('roundId')
-                            if incoming_rid and incoming_rid != self.tables[game_token].get('roundId'):
-                                self.tables[game_token]['roundId'] = incoming_rid
-
-                            # ── Round Result Detection ──
-                            # 7Mojos sends results in type-2 messages with various inner_types.
-                            # Look for winner/winSide/result fields in ALL type-2 messages.
-                            self._try_extract_result(game_token, inner_data, tname)
-
-                            # ── Bet confirmation detection ──
-                            # Server echoes back placed bets in various fields.
-                            # Common patterns: playerBets, currentBets, bets, acceptedBets
-                            possible_bet_fields = [
-                                inner_data.get('playerBets'),
-                                inner_data.get('currentBets'),
-                                inner_data.get('bets'),
-                                inner_data.get('acceptedBets'),
-                                inner_data.get('data', {}).get('playerBets') if isinstance(inner_data.get('data'), dict) else None,
-                            ]
-                            has_bet_data = inner_data.get('successful') in [True, "true", "True", 1] or any(
-                                v for v in possible_bet_fields
-                                if v and (isinstance(v, list) and len(v) > 0 or isinstance(v, dict))
-                            )
-                            if has_bet_data and game_token in self.pending_bet_acks:
-                                old_status = self.pending_bet_acks[game_token]['status']
-                                if old_status == 'pending':
-                                    self.pending_bet_acks[game_token]['status']  = 'confirmed'
-                                    self.pending_bet_acks[game_token]['raw']     = str(inner_data)[:200]
-                                    logger.info(f"[{self.name}] [{tname}] BET CONFIRMED by server")
-
-                            # ── Rejected bet detection ──
-                            # ONLY mark as rejected if:
-                            # 1. Server explicitly says successful=False, OR
-                            # 2. There's an error/failReason field AND no bet data was found
-                            # This prevents false rejections from normal status messages
-                            # that happen to have 'errorCode' or 'type' fields.
-                            is_explicit_fail = inner_data.get('successful') in [False, "false", "False", 0]
-                            err_msg = inner_data.get('failReason') or inner_data.get('errorMessage')
-                            # Only check error/errorCode if successful is explicitly False
-                            if is_explicit_fail and not err_msg:
-                                err_msg = (inner_data.get('error') or 
-                                          inner_data.get('errorCode') or 
-                                          inner_data.get('errorType') or
-                                          "Transaction unsuccessful")
-                            
-                            if err_msg and not has_bet_data and game_token in self.pending_bet_acks:
-                                if self.pending_bet_acks[game_token]['status'] == 'pending':
-                                    self.pending_bet_acks[game_token]['status'] = 'rejected'
-                                    self.pending_bet_acks[game_token]['raw']    = str(err_msg)[:200]
-                                    logger.warning(f"[{self.name}] [{tname}] BET REJECTED by server: {err_msg}")
-                                    logger.warning(f"[{self.name}] [{tname}] Rejection raw data: {str(inner_data)[:300]}")
-
-                        elif msg_type == 9:
-                            inner_data = payload.get('data', {})
-                            if isinstance(inner_data, str):
-                                try:
-                                    inner_data = json.loads(inner_data)
-                                except Exception as e:
-                                    logger.debug(f"[{self.name}] Type-9 parse error: {e}")
-                                    inner_data = {}
                             if isinstance(inner_data, dict):
-                                # Universal roundId update from type-9
                                 incoming_rid = inner_data.get('roundId')
-                                if incoming_rid:
+                                if incoming_rid and incoming_rid != self.tables[game_token].get('roundId'):
                                     self.tables[game_token]['roundId'] = incoming_rid
-                                # Bet confirmation in type-9 messages
-                                if game_token in self.pending_bet_acks:
-                                    bets_in_msg = inner_data.get('playerBets') or inner_data.get('bets')
-                                    if bets_in_msg and self.pending_bet_acks[game_token]['status'] == 'pending':
+
+                                self._try_extract_result(game_token, inner_data, tname)
+
+                                possible_bet_fields = [
+                                    inner_data.get('playerBets'),
+                                    inner_data.get('currentBets'),
+                                    inner_data.get('bets'),
+                                    inner_data.get('acceptedBets'),
+                                    inner_data.get('data', {}).get('playerBets') if isinstance(inner_data.get('data'), dict) else None,
+                                ]
+                                ab_bet_obj = inner_data.get('bet')
+                                has_ab_bet = False
+                                if isinstance(ab_bet_obj, dict):
+                                    andar_amt = ab_bet_obj.get('andarBet', 0) or 0
+                                    bahar_amt = ab_bet_obj.get('baharBet', 0) or 0
+                                    if andar_amt > 0 or bahar_amt > 0:
+                                        has_ab_bet = True
+
+                                has_bet_data = has_ab_bet or inner_data.get('successful') in [True, "true", "True", 1] or any(
+                                    v for v in possible_bet_fields
+                                    if v and (isinstance(v, list) and len(v) > 0 or isinstance(v, dict))
+                                )
+                                if has_bet_data and game_token in self.pending_bet_acks:
+                                    old_status = self.pending_bet_acks[game_token]['status']
+                                    if old_status == 'pending':
                                         self.pending_bet_acks[game_token]['status'] = 'confirmed'
-                                        logger.info(f"[{self.name}] BET CONFIRMED (type-9)")
+                                        self.pending_bet_acks[game_token]['raw'] = str(inner_data)[:200]
+                                        logger.info(f"[{self.name}] [{tname}] BET CONFIRMED by server")
+
+                                is_explicit_fail = inner_data.get('successful') in [False, "false", "False", 0]
+                                err_msg = inner_data.get('failReason') or inner_data.get('errorMessage')
+                                if is_explicit_fail and not err_msg:
+                                    err_msg = (inner_data.get('error') or 
+                                               inner_data.get('errorCode') or 
+                                               inner_data.get('errorType') or
+                                               "Transaction unsuccessful")
+
+                                if err_msg and not has_bet_data and game_token in self.pending_bet_acks:
+                                    if self.pending_bet_acks[game_token]['status'] == 'pending':
+                                        self.pending_bet_acks[game_token]['status'] = 'rejected'
+                                        self.pending_bet_acks[game_token]['raw'] = str(err_msg)[:200]
+                                        logger.warning(f"[{self.name}] [{tname}] BET REJECTED by server: {err_msg}")
+
+                        # NOTE: Removed dangerous catch-all that auto-confirmed on ANY message.
+                        # Real bet confirmations ONLY come from:
+                        # 1. andarBet/baharBet > 0 in inner_data.bet
+                        # 2. successful: true in inner_data  
+                        # 3. playerBets/currentBets/acceptedBets arrays
 
                         # Log unknown message types for discovery
                         elif msg_type not in (6,):
@@ -852,17 +888,29 @@ class BaccaratManager:
             return
 
         # ── Primary: Look for the dedicated result message ──
-        # These messages have 'gameRoundId' + 'result' + 'playerCards' + 'bankerCards'
-        if 'gameRoundId' in data and 'result' in data and 'playerCards' in data:
-            winner_raw = data.get('result')
+        # Baccarat: 'gameRoundId' + 'result' + 'playerCards' + 'bankerCards'
+        # Andar Bahar: 'gameRoundId' + 'winnerSide' + 'cardsDealt'
+        has_baccarat_result = 'gameRoundId' in data and 'result' in data and 'playerCards' in data
+        has_ab_result = 'gameRoundId' in data and 'winnerSide' in data and 'cardsDealt' in data
+        
+        if has_baccarat_result or has_ab_result:
+            winner_raw = data.get('winnerSide') if has_ab_result else data.get('result')
             round_id = data.get('gameRoundId')
-            player_cards = data.get('playerCards', [])
-            banker_cards = data.get('bankerCards', [])
-            win_amount = data.get('win', 0)
+            player_cards = data.get('playerCards', []) if has_baccarat_result else []
+            banker_cards = data.get('bankerCards', []) if has_baccarat_result else []
+            win_raw = data.get('win', 0)
+            # Andar Bahar sends win as dict: {"total": 171.0, "mainWin": 171.0, ...}
+            # Baccarat sends win as number: 171.0
+            if isinstance(win_raw, dict):
+                win_amount = float(win_raw.get('total') or win_raw.get('mainWin') or 0)
+            else:
+                win_amount = float(win_raw or 0)
+            cards_dealt = data.get('cardsDealt', 0)
+            joker_card = data.get('joker')
 
-            # Calculate totals from cards if available
-            player_total = self._calc_card_total(player_cards)
-            banker_total = self._calc_card_total(banker_cards)
+            # Calculate totals from cards if available (Baccarat only)
+            player_total = self._calc_card_total(player_cards) if has_baccarat_result else None
+            banker_total = self._calc_card_total(banker_cards) if has_baccarat_result else None
 
             # Normalize winner
             if isinstance(winner_raw, int):
@@ -882,6 +930,8 @@ class BaccaratManager:
                 'playerCards': player_cards,
                 'bankerCards': banker_cards,
                 'winAmount': win_amount,
+                'cardsDealt': cards_dealt,
+                'jokerCard': joker_card,
                 'timestamp': time.time(),
                 'account': self.name
             }
@@ -895,7 +945,10 @@ class BaccaratManager:
             if len(self.round_results) > 50:
                 self.round_results = self.round_results[-50:]
 
-            logger.info(f"[{self.name}] [{tname}] 🎯 RESULT: {winner} | P:{player_total} B:{banker_total} | Win:{win_amount} | Round:{round_id}")
+            if has_ab_result:
+                logger.info(f"[{self.name}] [{tname}] 🎯 RESULT: {winner} | Cards:{cards_dealt} | Win:{win_amount} | Round:{round_id}")
+            else:
+                logger.info(f"[{self.name}] [{tname}] 🎯 RESULT: {winner} | P:{player_total} B:{banker_total} | Win:{win_amount} | Round:{round_id}")
             return
 
         # ── Secondary: Check for winner/winSide in other message formats ──
@@ -958,7 +1011,9 @@ class BaccaratManager:
             self._coordinator_ref.check_auto_bet()
 
     async def _heartbeat_loop(self):
-        SILENCE_TIMEOUT = 8  # Seconds without ANY message = zombie WS → force close
+        # Andar Bahar has natural 7-12s silence between rounds (result → new round).
+        # Old 8s timeout caused false zombie detection. 25s safely covers worst-case gaps.
+        SILENCE_TIMEOUT = 25
         while self.running:
             # Snapshot to avoid dict-changed-size-during-iteration errors
             items = list(self.tables.items())
@@ -972,7 +1027,7 @@ class BaccaratManager:
                     except Exception as e:
                         logger.debug(f"[{self.name}] Heartbeat send failed for {info.get('name', token[:8])}: {e}")
 
-                    # 2. Silence watchdog: if WS reports open but no messages for 8s, force-close
+                    # 2. Silence watchdog: if WS reports open but no messages for 25s, force-close
                     last_msg = info.get('last_msg_at', 0)
                     if last_msg > 0 and (now - last_msg) > SILENCE_TIMEOUT:
                         tname = info.get('name', token[:8])
@@ -1081,7 +1136,7 @@ class BaccaratManager:
         Warms JIT code path. Actual amount is replaced at fire time in <1ms."""
         if game_token not in self.tables:
             return
-        for bet_type in [config.BACCARAT_PLAYER_BET_TYPE, config.BACCARAT_BANKER_BET_TYPE]:
+        for bet_type in [config.ANDAR_BET_TYPE, config.BAHAR_BET_TYPE]:
             try:
                 frame = self._build_raw_bet_frame(50.0, bet_type)
                 self.tables[game_token][f'prebuilt_frame_{bet_type}'] = frame
@@ -1093,14 +1148,19 @@ class BaccaratManager:
         logger.info(f"[{self.name}] [{tname}] ✅ FRAME READY — betting window open")
 
     @staticmethod
-    def _build_raw_bet_frame(amount, bet_type):
+    def _build_raw_bet_frame(amount, side=0, round_id=None):
         """Build a masked WebSocket TEXT frame for a bet. Returns raw bytes."""
+        clean_amt = int(amount) if isinstance(amount, (int, float)) and float(amount).is_integer() else amount
+        andar_val = clean_amt if side == 0 else 0
+        bahar_val = clean_amt if side == 1 else 0
+        inner_data = {
+            "bets": {"andarBet": andar_val, "baharBet": bahar_val, "sideBets": [], "win": 0, "processed": False},
+            "gameplayMessageType": 0
+        }
+        if round_id:
+            inner_data["roundId"] = round_id
         payload_obj = {
-            "arguments": [{"type": 1, "data": json.dumps({
-                "areBetsInZeroCommMode": False,
-                "bets": [{"type": bet_type, "bet": amount}],
-                "gameplayMessageType": 0
-            })}],
+            "arguments": [{"type": 1, "data": json.dumps(inner_data)}],
             "target": "Message", "type": 1
         }
         raw_payload = (json.dumps(payload_obj) + '\x1e').encode('utf-8')
@@ -1278,8 +1338,8 @@ class BaccaratManager:
 
 class GlobalCoordinator:
     def __init__(self):
-        self.account1 = BaccaratManager("Account 1 (Player)", config.BACCARAT_PLAYER_BET_TYPE)
-        self.account2 = BaccaratManager("Account 2 (Banker)", config.BACCARAT_BANKER_BET_TYPE)
+        self.account1 = BaccaratManager("Account 1 (Andar)", config.ANDAR_BET_TYPE)
+        self.account2 = BaccaratManager("Account 2 (Bahar)", config.BAHAR_BET_TYPE)
         self.auto_bet_requested = False
         self.bet_state = "idle"  # idle | armed | placing | placed
         self.last_bet_result = None
@@ -1311,8 +1371,8 @@ class GlobalCoordinator:
         gc.collect()
         
         # Fully recreate instances to wipe all cache, tables, and balances
-        self.account1    = BaccaratManager("Account 1 (Player)", config.BACCARAT_PLAYER_BET_TYPE)
-        self.account2    = BaccaratManager("Account 2 (Banker)", config.BACCARAT_BANKER_BET_TYPE)
+        self.account1    = BaccaratManager("Account 1 (Andar)", config.ANDAR_BET_TYPE)
+        self.account2    = BaccaratManager("Account 2 (Bahar)", config.BAHAR_BET_TYPE)
         self.account1._coordinator_ref    = self
         self.account2._coordinator_ref    = self
         self.auto_bet_requested  = False
@@ -1340,7 +1400,7 @@ class GlobalCoordinator:
 
         self.auto_bet_requested = False
         self.bet_state = "idle"
-        return {"success": True, "message": "Both accounts logged in! Baccarat connected. Press Arm to start."}
+        return {"success": True, "message": "Both accounts logged in! Andar Bahar twin tables connected. Press Arm to start."}
         
     def check_auto_bet(self):
         if not self._bet_lock.acquire(blocking=False):
@@ -1408,11 +1468,11 @@ class GlobalCoordinator:
                 continue
 
             worst_elapsed = max(elapsed1, elapsed2)
-            remaining = max(12.0 - worst_elapsed, 0)
+            remaining = max(15.0 - worst_elapsed, 0)  # Andar Bahar has 15s timer
             valid_tables.append((token, info, remaining))
 
-        # ═══ PRE-CHECK: ALL 4 TABLES MUST BE CONNECTED ═══
-        # Before firing on best 2, verify every single table is alive on both accounts
+        # ═══ PRE-CHECK: BOTH TWIN TABLES MUST BE CONNECTED ═══
+        # Before firing, verify both ab-3 and ab-4 are alive on both accounts
         all_tables_connected = True
         for token, info in list(self.account1.tables.items()):
             tname = info.get('name', token[:8])
@@ -1457,8 +1517,8 @@ class GlobalCoordinator:
             logger.debug(f"🔍 Table scan: {len(valid_tables)} valid, {len(skip_reasons)} skipped [{reasons_str}]")
         
         if len(valid_tables) >= 2:
-            if self.account1.balance < 50 or self.account2.balance < 50:
-                logger.warning("Insufficient balance in one or both accounts.")
+            if self.account1.balance < 90 or self.account2.balance < 90:
+                logger.warning("Insufficient balance in one or both accounts (minimum ₹90 required).")
                 self.auto_bet_requested = False
                 self.bet_state = "idle"
                 return
@@ -1468,25 +1528,25 @@ class GlobalCoordinator:
             # Target bet size calculation based on bet_mode
             t1_token, t1_info = target_tables[0]
             t2_token, t2_info = target_tables[1]
-            t1_max = t1_info.get('max_bet', 100.0)
-            t2_max = self.account2.tables.get(t2_token, {}).get('max_bet', 100.0)
+            t1_max = t1_info.get('max_bet', 900000.0)
+            t2_max = self.account2.tables.get(t2_token, {}).get('max_bet', 900000.0)
             max_allowed_bet = min(t1_max, t2_max)
 
-            # 🔥 RACE CONDITION BYPASS: We intentionally do NOT divide the balance by 2.
-            # We want to send the full bet amount to BOTH tables simultaneously and let the
-            # server race to see which one accepts it (or if both glitch and accept it).
+            # 🔥 RACE CONDITION BYPASS: Send full bet amount to BOTH tables simultaneously
             effective_balance = min(self.account1.balance, self.account2.balance)
 
+            # Andar Bahar minimum chip is ₹90 (chips: 90, 180, 450, 900...)
+            CHIP_STEP = 90.0
             if self.bet_mode == 'fixed':
-                base_bet = float((int(self.bet_target_amount) // 50) * 50)
-                max_possible_bet = float((int(effective_balance) // 50) * 50)
+                base_bet = float((int(self.bet_target_amount) // int(CHIP_STEP)) * CHIP_STEP)
+                max_possible_bet = float((int(effective_balance) // int(CHIP_STEP)) * CHIP_STEP)
                 bet_amount = min(base_bet, max_possible_bet, max_allowed_bet)
             else:  # auto
-                base_bet = float((int(effective_balance) // 50) * 50)
+                base_bet = float((int(effective_balance) // int(CHIP_STEP)) * CHIP_STEP)
                 bet_amount = min(base_bet, max_allowed_bet)
             
-            if bet_amount < 50.0:
-                logger.warning(f"Calculated bet amount {bet_amount:.2f} is below minimum chip size 50.0. Skipping round.")
+            if bet_amount < CHIP_STEP:
+                logger.warning(f"Calculated bet amount {bet_amount:.2f} is below minimum chip size {CHIP_STEP}. Skipping round.")
                 self.auto_bet_requested = False
                 self.bet_state = "idle"
                 return
@@ -1499,10 +1559,10 @@ class GlobalCoordinator:
 
             # Build individual bet objects for UI tracking
             individual_bets = [
-                {"id": 0, "account": "Account 1", "bet_on": "Player", "table": table_names[0], "amount": bet_amount, "status": "placing", "error": None},
-                {"id": 1, "account": "Account 1", "bet_on": "Player", "table": table_names[1], "amount": bet_amount, "status": "placing", "error": None},
-                {"id": 2, "account": "Account 2", "bet_on": "Banker", "table": table_names[0], "amount": bet_amount, "status": "placing", "error": None},
-                {"id": 3, "account": "Account 2", "bet_on": "Banker", "table": table_names[1], "amount": bet_amount, "status": "placing", "error": None},
+                {"id": 0, "account": "Account 1", "bet_on": "Andar", "table": table_names[0], "amount": bet_amount, "status": "placing", "error": None},
+                {"id": 1, "account": "Account 1", "bet_on": "Andar", "table": table_names[1], "amount": bet_amount, "status": "placing", "error": None},
+                {"id": 2, "account": "Account 2", "bet_on": "Bahar", "table": table_names[0], "amount": bet_amount, "status": "placing", "error": None},
+                {"id": 3, "account": "Account 2", "bet_on": "Bahar", "table": table_names[1], "amount": bet_amount, "status": "placing", "error": None},
             ]
 
             self.bet_state = "placing"
@@ -1564,62 +1624,76 @@ class GlobalCoordinator:
                     if tok in acc2.tables:
                         acc2.tables[tok]['frame_ready'] = True
                 
-                # Step 2: Pre-resolve loops, transports, and frames grouped by account with latency alignment
-                acc1_jobs = []
-                acc2_jobs = []
-                
-                # Fetch current latencies (RTTs)
-                latencies = {}
+                # Step 2: Build text payloads for ws.send() with SignalR invocationId: "0" and active roundId
+                bet_payloads = {}  # (tok, account) -> text string
+                clean_amt = int(bet_amt) if isinstance(bet_amt, (int, float)) and float(bet_amt).is_integer() else bet_amt
                 for tok, info in tables:
-                    lat1 = acc1.tables.get(tok, {}).get('latency', 40)
-                    lat2 = acc2.tables.get(tok, {}).get('latency', 40)
-                    latencies[(tok, 'acc1')] = 40 if lat1 <= 0 else int(lat1)
-                    latencies[(tok, 'acc2')] = 40 if lat2 <= 0 else int(lat2)
+                    rid = info.get('roundId') or acc1.tables.get(tok, {}).get('roundId') or acc2.tables.get(tok, {}).get('roundId')
+                    
+                    data1 = {"bets": {"andarBet": clean_amt, "baharBet": 0, "sideBets": [], "win": 0, "processed": False}, "gameplayMessageType": 0}
+                    data2 = {"bets": {"andarBet": 0, "baharBet": clean_amt, "sideBets": [], "win": 0, "processed": False}, "gameplayMessageType": 0}
+                    if rid:
+                        data1["roundId"] = rid
+                        data2["roundId"] = rid
+                        
+                    payload1 = json.dumps({
+                        "arguments": [{"type": 1, "data": json.dumps(data1)}],
+                        "target": "Message",
+                        "type": 1
+                    }) + '\x1e'
+                    payload2 = json.dumps({
+                        "arguments": [{"type": 1, "data": json.dumps(data2)}],
+                        "target": "Message",
+                        "type": 1
+                    }) + '\x1e'
+                    bet_payloads[(tok, 'acc1')] = payload1
+                    bet_payloads[(tok, 'acc2')] = payload2
                 
-                # Calculate estimated one-way latency (RTT / 2) in seconds
-                one_ways = {k: (v / 2.0) / 1000.0 for k, v in latencies.items()}
-                max_one_way = max(one_ways.values()) if one_ways else 0.0
-                
-                # Calculate target delay for each connection to reach the server simultaneously
-                delays = {k: max_one_way - v for k, v in one_ways.items()}
-                
+                # Collect ws objects for firing
+                acc1_ws_jobs = []  # (ws, payload, tname)
+                acc2_ws_jobs = []
                 for tok, info in tables:
                     tname = info.get('name', tok[:8])
                     ws1 = acc1.tables.get(tok, {}).get('ws')
                     ws2 = acc2.tables.get(tok, {}).get('ws')
-                    t1 = getattr(ws1, 'transport', None) if ws1 else None
-                    t2 = getattr(ws2, 'transport', None) if ws2 else None
-                    
-                    if t1 and acc1.loop:
-                        d1 = delays.get((tok, 'acc1'), 0.0)
-                        acc1_jobs.append((t1, prebuilt[(tok, 'acc1')], tname, d1))
-                    if t2 and acc2.loop:
-                        d2 = delays.get((tok, 'acc2'), 0.0)
-                        acc2_jobs.append((t2, prebuilt[(tok, 'acc2')], tname, d2))
+                    if ws1 and acc1.loop:
+                        acc1_ws_jobs.append((ws1, bet_payloads[(tok, 'acc1')], tname))
+                    if ws2 and acc2.loop:
+                        acc2_ws_jobs.append((ws2, bet_payloads[(tok, 'acc2')], tname))
                 
-                # Sort all jobs together by delay descending (slowest link fired first)
-                all_jobs = acc1_jobs + acc2_jobs
-                all_jobs.sort(key=lambda x: x[3], reverse=True)
-                
-                # Step 3: Fire directly on the current (Coordinator) thread to bypass event loop scheduling lag!
+                # Step 3: Fire via ws.send() through asyncio — proper framing through proxy
                 fire_start = time.time()
                 send_failed = False
+                futures = []
                 
-                gc.disable()
+                async def _send_bet(ws_obj, payload_str, account_label, tname_label):
+                    BaccaratManager._log_raw_frame("-->", account_label, tname_label, payload_str)
+                    await ws_obj.send(payload_str)
+                
                 try:
-                    for transport, frame, tname_r, delay in all_jobs:
-                        # Microsecond level delay alignment via spin-lock wait
-                        while (time.time() - fire_start) < delay:
-                            pass
-                        transport.write(frame)
+                    # Fire all Account 1 bets
+                    for ws_obj, payload_str, tname_r in acc1_ws_jobs:
+                        fut = asyncio.run_coroutine_threadsafe(_send_bet(ws_obj, payload_str, acc1.name, tname_r), acc1.loop)
+                        futures.append((fut, f"Acc1-{tname_r}"))
+                    
+                    # Fire all Account 2 bets
+                    for ws_obj, payload_str, tname_r in acc2_ws_jobs:
+                        fut = asyncio.run_coroutine_threadsafe(_send_bet(ws_obj, payload_str, acc2.name, tname_r), acc2.loop)
+                        futures.append((fut, f"Acc2-{tname_r}"))
+                    
+                    # Wait for all sends to complete (max 2s)
+                    for fut, label in futures:
+                        try:
+                            fut.result(timeout=2.0)
+                        except Exception as e:
+                            logger.error(f"⚡ Send failed for {label}: {e}")
+                            send_failed = True
                 except Exception as e:
                     logger.error(f"⚡ Firing loop execution failed: {e}")
                     send_failed = True
-                finally:
-                    gc.enable()
                 
                 fire_elapsed = (time.time() - fire_start) * 1000
-                total_jobs = len(acc1_jobs) + len(acc2_jobs)
+                total_jobs = len(acc1_ws_jobs) + len(acc2_ws_jobs)
                 
                 # Check if we successfully queued all jobs
                 expected_jobs = len(tables) * 2
@@ -1628,10 +1702,10 @@ class GlobalCoordinator:
                     send_failed = True
                 
                 # Log timing and status
-                for _, _, tname_r, d_r in acc1_jobs:
-                    logger.info(f"⚡ Acc1 [{tname_r}] queued in batch write (offset: {d_r*1000:.1f}ms)")
-                for _, _, tname_r, d_r in acc2_jobs:
-                    logger.info(f"⚡ Acc2 [{tname_r}] queued in batch write (offset: {d_r*1000:.1f}ms)")
+                for _, _, tname_r in acc1_ws_jobs:
+                    logger.info(f"⚡ Acc1 [{tname_r}] bet sent via ws.send()")
+                for _, _, tname_r in acc2_ws_jobs:
+                    logger.info(f"⚡ Acc2 [{tname_r}] bet sent via ws.send()")
                 
                 if send_failed:
                     logger.warning(f"⚡ DIRECT WRITE FAILED ({fire_elapsed:.1f}ms) — undoing ALL")
@@ -1645,22 +1719,24 @@ class GlobalCoordinator:
                 self.last_bet_result['fire_elapsed_ms'] = round(fire_elapsed, 1)
                 avg_ms = fire_elapsed / max(total_jobs, 1)
                 self.last_bet_result['fire_details'] = []
-                for _, _, tname_r, _ in acc1_jobs:
+                for _, _, tname_r in acc1_ws_jobs:
                     self.last_bet_result['fire_details'].append({'table': tname_r, 'account': 'Acc1', 'ok': True, 'ms': round(avg_ms, 2)})
-                for _, _, tname_r, _ in acc2_jobs:
+                for _, _, tname_r in acc2_ws_jobs:
                     self.last_bet_result['fire_details'].append({'table': tname_r, 'account': 'Acc2', 'ok': True, 'ms': round(avg_ms, 2)})
 
                 # ══════════════════════════════════════════════════
                 # ⏱️ POLL FOR ALL 4 CONFIRMATIONS
                 # ══════════════════════════════════════════════════
-                max_polls = 6  # 6 × 150ms = 900ms max
+                # Andar Bahar confirmations can take 1-3s through proxy.
+                # Old 900ms window caused false HEDGE BROKEN events.
+                max_polls = 20  # 20 × 150ms = 3s max
                 fire_time = time.time()
                 all_confirmed = False
 
                 for poll in range(max_polls):
                     time.sleep(0.15)
 
-                    if time.time() - fire_time > 1.2:
+                    if time.time() - fire_time > 4.0:
                         logger.warning(f"⏰ HARD DEADLINE reached ({time.time()-fire_time:.1f}s)")
                         break
 
@@ -1947,8 +2023,8 @@ class GlobalCoordinator:
             if self.telegram:
                 self.telegram.send_message(err)
 
-        t1 = threading.Thread(target=_undo_one_account, args=(acc1, "Acc1 (Player)", acc1.bet_type, bal1_bef), daemon=True)
-        t2 = threading.Thread(target=_undo_one_account, args=(acc2, "Acc2 (Banker)", acc2.bet_type, bal2_bef), daemon=True)
+        t1 = threading.Thread(target=_undo_one_account, args=(acc1, "Acc1 (Andar)", acc1.bet_type, bal1_bef), daemon=True)
+        t2 = threading.Thread(target=_undo_one_account, args=(acc2, "Acc2 (Bahar)", acc2.bet_type, bal2_bef), daemon=True)
         t1.start()
         t2.start()
         t1.join(timeout=6)
@@ -2090,11 +2166,11 @@ class GlobalCoordinator:
 
         # Create fresh BaccaratManager for the burned account
         if account_num == 1:
-            new_acct = BaccaratManager("Account 1 (Player)", config.BACCARAT_PLAYER_BET_TYPE)
+            new_acct = BaccaratManager("Account 1 (Andar)", config.ANDAR_BET_TYPE)
             self.account1 = new_acct
             self.initial_balance1 = 0.0
         else:
-            new_acct = BaccaratManager("Account 2 (Banker)", config.BACCARAT_BANKER_BET_TYPE)
+            new_acct = BaccaratManager("Account 2 (Bahar)", config.BAHAR_BET_TYPE)
             self.account2 = new_acct
             self.initial_balance2 = 0.0
 
@@ -2151,8 +2227,8 @@ class GlobalCoordinator:
         self.account1.pending_bet_acks[target_token] = {'status': 'pending', 'raw': None}
 
         # Build 2 separate ₹50 bet frames
-        frame1 = BaccaratManager._build_raw_bet_frame(50.0, config.BACCARAT_PLAYER_BET_TYPE)
-        frame2 = BaccaratManager._build_raw_bet_frame(50.0, config.BACCARAT_PLAYER_BET_TYPE)
+        frame1 = BaccaratManager._build_raw_bet_frame(50.0, config.ANDAR_BET_TYPE)
+        frame2 = BaccaratManager._build_raw_bet_frame(50.0, config.ANDAR_BET_TYPE)
 
         ws = self.account1.tables[target_token]['ws']
         transport = ws.transport
@@ -2216,7 +2292,7 @@ class GlobalCoordinator:
 
         # Send UNDO to clean up the test bets
         try:
-            undo_frame = BaccaratManager._build_raw_bet_frame(0.0, config.BACCARAT_PLAYER_BET_TYPE)
+            undo_frame = BaccaratManager._build_raw_bet_frame(0.0, config.ANDAR_BET_TYPE)
             undo_payload = json.dumps({
                 "arguments": [{"type": 1, "data": json.dumps({
                     "areBetsInZeroCommMode": False,

@@ -1226,7 +1226,64 @@
             .table-name { font-size: 11px; }
 
             .login-box { padding: 20px 14px; }
-            .login-title { font-size: 16px; }
+        }
+
+        /* ─── REALTIME MOBILE NETWORK SIGNAL ─── */
+        .network-signal-container {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border);
+            padding: 6px 12px;
+            border-radius: 20px;
+            transition: all 0.3s ease;
+            height: fit-content;
+        }
+        .network-bars {
+            display: inline-flex;
+            align-items: flex-end;
+            gap: 2.5px;
+            width: 20px;
+            height: 14px;
+        }
+        .network-bars .bar {
+            width: 3px;
+            background: rgba(255, 255, 255, 0.15);
+            border-radius: 1px;
+            transition: background 0.3s ease, height 0.3s ease;
+        }
+        .network-bars .bar-1 { height: 30%; }
+        .network-bars .bar-2 { height: 50%; }
+        .network-bars .bar-3 { height: 75%; }
+        .network-bars .bar-4 { height: 100%; }
+
+        /* Color classes depending on RTT latency */
+        .network-signal-container.excellent .bar { background: #2ecc71; }
+        
+        .network-signal-container.good .bar-1,
+        .network-signal-container.good .bar-2,
+        .network-signal-container.good .bar-3 { background: #2ecc71; }
+        .network-signal-container.good .bar-4 { background: rgba(255, 255, 255, 0.15); }
+
+        .network-signal-container.fair .bar-1,
+        .network-signal-container.fair .bar-2 { background: #f1c40f; }
+        .network-signal-container.fair .bar-3,
+        .network-signal-container.fair .bar-4 { background: rgba(255, 255, 255, 0.15); }
+
+        .network-signal-container.poor .bar-1 { background: #e74c3c; }
+        .network-signal-container.poor .bar-2,
+        .network-signal-container.poor .bar-3,
+        .network-signal-container.poor .bar-4 { background: rgba(255, 255, 255, 0.15); }
+
+        .network-signal-container.disconnected .bar { background: rgba(255, 255, 255, 0.15); }
+        
+        .latency-value {
+            font-size: 11px;
+            font-weight: 800;
+            color: var(--text);
+            font-family: monospace;
+            letter-spacing: 0.2px;
         }
     </style>
 </head>
@@ -1297,7 +1354,7 @@
                 </svg>
             </div>
             <div class="login-title">7Mojo Dual Hedge</div>
-            <div class="login-sub">Connect two accounts for simultaneous baccarat hedging</div>
+            <div class="login-sub">Connect two accounts for Twin Andar Bahar hedging</div>
         </div>
 
         <!-- NEW: BASE URL SELECTOR -->
@@ -1313,7 +1370,7 @@
 
         <div class="cred-grid">
             <div class="cred-block player">
-                <div class="cred-label player">Account 1 — Player</div>
+                <div class="cred-label player">Account 1 — Andar</div>
                 <div class="field">
                     <label>Username</label>
                     <input type="text" id="user1" placeholder="Enter username" autocomplete="off">
@@ -1325,7 +1382,7 @@
             </div>
 
             <div class="cred-block banker">
-                <div class="cred-label banker">Account 2 — Banker</div>
+                <div class="cred-label banker">Account 2 — Bahar</div>
                 <div class="field">
                     <label>Username</label>
                     <input type="text" id="user2" placeholder="Enter username" autocomplete="off">
@@ -1363,19 +1420,30 @@
             <div class="topbar-brand">
                 7MOJO DUAL HEDGE
                 <span id="success-badge" class="pill pill-confirm" style="display:none; margin-left:10px; font-size:11px; padding:2px 8px; vertical-align: middle;">🎉 3x Target Reached!</span>
-                <span>Player &amp; Banker Sync System</span>
+                <span>Andar & Bahar Sync System</span>
             </div>
             <button class="btn btn-outline" style="font-size: 10px; padding: 6px 12px; height: fit-content;" onclick="goToLogin()" title="Return to login screen and switch accounts">🔑 Switch Accounts</button>
+            
+            <!-- Real-time Mobile Network Signal Strength Indicator -->
+            <div class="network-signal-container disconnected" id="net-signal" title="Connecting...">
+                <div class="network-bars" style="margin-top: 1px;">
+                    <div class="bar bar-1"></div>
+                    <div class="bar bar-2"></div>
+                    <div class="bar bar-3"></div>
+                    <div class="bar bar-4"></div>
+                </div>
+                <span class="latency-value" id="net-latency-val">-- ms</span>
+            </div>
         </div>
         <div class="bal-row">
             <div class="bal-card player">
-                <div class="bal-label">Acc 1 — Player</div>
+                <div class="bal-label" id="label-acc1">Acc 1 — Andar</div>
                 <div class="bal-amount" id="bal1">Rs. 0.00</div>
                 <div id="init-bal1" style="font-size:10px; color:var(--muted); margin-top:2px;">Start: Rs. 0.00</div>
                 <button id="burn-btn-1" class="btn btn-primary" style="display:none; margin-top:5px; font-size:12px; padding:4px 8px; background:#e74c3c; border-color:#c0392b; width: 100%;" onclick="triggerBurn(1)">🔥 Burn Account</button>
             </div>
             <div class="bal-card banker">
-                <div class="bal-label">Acc 2 — Banker</div>
+                <div class="bal-label" id="label-acc2">Acc 2 — Bahar</div>
                 <div class="bal-amount" id="bal2">Rs. 0.00</div>
                 <div id="init-bal2" style="font-size:10px; color:var(--muted); margin-top:2px;">Start: Rs. 0.00</div>
                 <button id="burn-btn-2" class="btn btn-primary" style="display:none; margin-top:5px; font-size:12px; padding:4px 8px; background:#e74c3c; border-color:#c0392b; width: 100%;" onclick="triggerBurn(2)">🔥 Burn Account</button>
@@ -1406,11 +1474,11 @@
                     <span style="font-size: 13px; color: var(--muted); white-space: nowrap;">Bet Size:</span>
                     <select id="bet-mode-select" onchange="toggleCustomBetAmount()" style="background: var(--surface); color: var(--text); border: 1px solid var(--border); padding: 6px 12px; border-radius: 4px; font-size: 13px; outline: none; cursor: pointer;">
                         <option value="auto">Auto (Max Balance)</option>
-                        <option value="50">Fixed 50 Rs</option>
-                        <option value="100" selected>Fixed 100 Rs</option>
-                        <option value="250">Fixed 250 Rs</option>
-                        <option value="500">Fixed 500 Rs</option>
-                        <option value="1000">Fixed 1000 Rs</option>
+                        <option value="90" selected>Fixed 90 Rs</option>
+                        <option value="180">Fixed 180 Rs</option>
+                        <option value="270">Fixed 270 Rs</option>
+                        <option value="450">Fixed 450 Rs</option>
+                        <option value="900">Fixed 900 Rs</option>
                         <option value="custom">Custom Amount</option>
                     </select>
                     <input type="number" id="custom-amount-input" placeholder="Custom Rs" style="display: none; width: 100px; padding: 6px; border-radius: 4px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-size: 13px; outline: none;">
@@ -1450,7 +1518,7 @@
             <div class="tables-panel-head">
                 <div class="panel-head-left">
                     <div class="panel-dot green"></div>
-                    <div class="panel-title green">Account 1 — Player</div>
+                    <div class="panel-title green">Account 1 — Andar</div>
                 </div>
                 <div class="panel-count" id="count1">0 tables</div>
             </div>
@@ -1464,7 +1532,7 @@
             <div class="tables-panel-head">
                 <div class="panel-head-left">
                     <div class="panel-dot cyan"></div>
-                    <div class="panel-title cyan">Account 2 — Banker</div>
+                    <div class="panel-title cyan">Account 2 — Bahar</div>
                 </div>
                 <div class="panel-count" id="count2">0 tables</div>
             </div>
@@ -1506,6 +1574,19 @@
 
 
 <script>
+    // 🚨 Global JS Error reporting to backend logs
+    window.onerror = function(message, source, lineno, colno, error) {
+        const body = {
+            message: message,
+            stack: error ? error.stack : `at ${source}:${lineno}:${colno}`
+        };
+        fetch('/api/js_error', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        }).catch(()=>{});
+    };
+    
     // ─── MULTI-TENANT SESSION MANAGEMENT ─────────────────────
     let sessionId = localStorage.getItem('sessionId');
     if (!sessionId) {
@@ -1923,8 +2004,8 @@
         } else if (select.value === 'custom') {
             mode = 'fixed';
             const val = parseFloat(document.getElementById('custom-amount-input').value);
-            if (isNaN(val) || val < 50) {
-                toast('Invalid Amount', 'Please enter a custom amount of at least 50 Rs.', 'warn', 4000);
+            if (isNaN(val) || val < 90) {
+                toast('Invalid Amount', 'Please enter a custom amount of at least 90 Rs (minimum chip size).', 'warn', 4000);
                 armBtn.disabled = false;
                 return;
             }
@@ -2074,7 +2155,7 @@
                 <div class="strip-indicator amber"></div>
                 <div class="strip-text">
                     <strong>Armed &amp; Scanning</strong>
-                    <p>Waiting for 2 baccarat tables with sufficient betting time remaining...</p>
+                    <p>Waiting for 2 Andar Bahar twin tables with sufficient betting time remaining...</p>
                 </div>`;
 
         } else if (state === 'placing') {
@@ -2102,7 +2183,7 @@
                     <div class="strip-indicator blue"></div>
                     <div class="strip-text">
                         <strong>Firing 4 Bets Simultaneously</strong>
-                        <p>Account 1: Rs. ${b1} Player &mdash; Account 2: Rs. ${b2} Banker</p>
+                        <p>Account 1: Rs. ${b1} Andar &mdash; Account 2: Rs. ${b2} Bahar</p>
                     </div>
                     ${fireLabel}
                     <div class="dots" style="color:var(--blue)"><i></i><i></i><i></i></div>
@@ -2112,7 +2193,7 @@
             strip.innerHTML = header + rows;
 
             clearToasts();
-            toast('Placing 4 Bets', `Acc1: Rs. ${b1} Player on 2 tables &mdash; Acc2: Rs. ${b2} Banker on 2 tables`, 'placing', 5000);
+            toast('Placing 4 Bets', `Acc1: Rs. ${b1} Andar on 2 tables &mdash; Acc2: Rs. ${b2} Bahar on 2 tables`, 'placing', 5000);
 
         } else if (state === 'placed') {
             armBtn.classList.add('btn-placed');
@@ -2161,7 +2242,7 @@
                 : bad === 0
                     ? `${confirmed} Confirmed, ${sent_unconf} Unverified`
                     : `${confirmed}/4 Bets OK — ${bad} Problem(s)`;
-            toast(toastTitle, `Acc1: Rs. ${b1} Player &mdash; Acc2: Rs. ${b2} Banker`, toastType, 8000);
+            toast(toastTitle, `Acc1: Rs. ${b1} Andar &mdash; Acc2: Rs. ${b2} Bahar`, toastType, 8000);
 
         } else if (state === 'armed' && result?.type === 'undone') {
             // ═══ AUTONOMOUS UNDO + RE-ARM — Show brief notification ═══
@@ -2209,10 +2290,10 @@
     function renderBetRows(bets, tables, b1, b2) {
         if (!bets || bets.length === 0) {
             bets = [
-                {account:'Account 1', bet_on:'Player',  table: tables[0] || 'Table A', amount: b1, status:'placing', error:null},
-                {account:'Account 1', bet_on:'Player',  table: tables[1] || 'Table B', amount: b1, status:'placing', error:null},
-                {account:'Account 2', bet_on:'Banker',  table: tables[0] || 'Table A', amount: b2, status:'placing', error:null},
-                {account:'Account 2', bet_on:'Banker',  table: tables[1] || 'Table B', amount: b2, status:'placing', error:null},
+                {account:'Account 1', bet_on:'Andar',  table: tables[0] || 'Table A', amount: b1, status:'placing', error:null},
+                {account:'Account 1', bet_on:'Andar',  table: tables[1] || 'Table B', amount: b1, status:'placing', error:null},
+                {account:'Account 2', bet_on:'Bahar',  table: tables[0] || 'Table A', amount: b2, status:'placing', error:null},
+                {account:'Account 2', bet_on:'Bahar',  table: tables[1] || 'Table B', amount: b2, status:'placing', error:null},
             ];
         }
 
@@ -2255,7 +2336,7 @@
                         break;
                 }
 
-                const accentColor = b.bet_on === 'Player' ? 'var(--green)' : 'var(--cyan)';
+                const accentColor = b.bet_on === 'Andar' ? 'var(--green)' : 'var(--cyan)';
                 const errLine = (b.error && (b.status === 'failed' || b.status === 'rejected'))
                     ? `<div style="font-size:10px;color:var(--red);margin-top:4px;word-break:break-word;line-height:1.4;">${b.error}</div>`
                     : '';
@@ -2381,12 +2462,12 @@
             if (t.last_result && t.last_result.winner) {
                 const w = t.last_result.winner;
                 let badgeCls = 'unknown-win';
-                if (w === 'Player') badgeCls = 'player-win';
-                else if (w === 'Banker') badgeCls = 'banker-win';
+                if (w === 'Andar') badgeCls = 'player-win';
+                else if (w === 'Bahar') badgeCls = 'banker-win';
                 else if (w === 'Tie') badgeCls = 'tie-win';
-                const pScore = t.last_result.playerTotal != null ? t.last_result.playerTotal : '?';
-                const bScore = t.last_result.bankerTotal != null ? t.last_result.bankerTotal : '?';
-                resultHtml = `<span class="result-badge ${badgeCls}">${w}</span><span class="result-score">P:${pScore} B:${bScore}</span>`;
+                const pScore = t.last_result.cardsDealt != null ? t.last_result.cardsDealt : (t.last_result.playerTotal != null ? t.last_result.playerTotal : '?');
+                const bScore = t.last_result.jokerCard ? `J:${t.last_result.jokerCard.rank || '?'}` : (t.last_result.bankerTotal != null ? t.last_result.bankerTotal : '?');
+                resultHtml = `<span class="result-badge ${badgeCls}">${w}</span><span class="result-score">Cards:${pScore} ${bScore}</span>`;
             }
 
             const cardId = `tc-${gridId}-${t.token}`;
@@ -2500,6 +2581,37 @@
                 const remTime = data.system_time_remaining || 0;
                 const reasons = data.system_signal_reasons || [];
                 
+                // Real-time network signal strength update
+                const netSignal = document.getElementById('net-signal');
+                const netLatencyVal = document.getElementById('net-latency-val');
+                if (netSignal && netLatencyVal) {
+                    const hasConnectedTables = (data.tables1 && data.tables1.some(t => t.status !== 'Disconnected' && t.status !== 'Reconnecting...')) ||
+                                               (data.tables2 && data.tables2.some(t => t.status !== 'Disconnected' && t.status !== 'Reconnecting...'));
+                    
+                    if (!hasConnectedTables) {
+                        netSignal.className = 'network-signal-container disconnected';
+                        netLatencyVal.innerText = '-- ms';
+                        netSignal.title = 'Disconnected';
+                    } else {
+                        const latVal = Math.round(lat);
+                        netLatencyVal.innerText = `${latVal} ms`;
+                        netSignal.title = `Latency: ${latVal} ms`;
+                        
+                        if (latVal <= 0) {
+                            netSignal.className = 'network-signal-container disconnected';
+                            netLatencyVal.innerText = 'offline';
+                        } else if (latVal <= 80) {
+                            netSignal.className = 'network-signal-container excellent';
+                        } else if (latVal <= 150) {
+                            netSignal.className = 'network-signal-container good';
+                        } else if (latVal <= 250) {
+                            netSignal.className = 'network-signal-container fair';
+                        } else {
+                            netSignal.className = 'network-signal-container poor';
+                        }
+                    }
+                }
+                
                 if (signal === 'green') {
                     signalDot.style.background = '#2ecc71';
                     signalDot.style.boxShadow = '0 0 10px #2ecc71';
@@ -2580,6 +2692,10 @@
             document.getElementById('bal1').innerText = 'Rs. ' + (data.balance1 || 0).toFixed(2);
             document.getElementById('bal2').innerText = 'Rs. ' + (data.balance2 || 0).toFixed(2);
             
+            // Obfuscated temporary nicknames
+            document.getElementById('label-acc1').innerText = 'Acc 1 — Andar' + (data.nickname1 ? ' (' + data.nickname1 + ')' : '');
+            document.getElementById('label-acc2').innerText = 'Acc 2 — Bahar' + (data.nickname2 ? ' (' + data.nickname2 + ')' : '');
+            
             // Starting balances
             document.getElementById('init-bal1').innerText = 'Start: Rs. ' + (data.initial_balance1 || 0).toFixed(2);
             document.getElementById('init-bal2').innerText = 'Start: Rs. ' + (data.initial_balance2 || 0).toFixed(2);
@@ -2594,11 +2710,11 @@
             // Update local storage history with real-time balance
             updateActiveBalanceInHistory(data.balance1 || 0, data.balance2 || 0);
 
-            // Baccarat Tables
+            // Andar Bahar Tables
             renderTables('tables-grid-1', 'count1', data.tables1);
             renderTables('tables-grid-2', 'count2', data.tables2);
 
-            // Baccarat Bet state
+            // Andar Bahar Bet state
             const state    = data.bet_state || 'idle';
             const betStr   = JSON.stringify(data.last_bet_result);
             if (state !== lastBetState || betStr !== lastBetDataStr) {
@@ -2698,7 +2814,16 @@
                 burnStartTime = null;
             }
 
-        } catch(e) {}
+        } catch(e) {
+            fetch('/api/js_error', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    message: "fetchStatus error: " + e.message,
+                    stack: e.stack
+                })
+            }).catch(()=>{});
+        }
         finally { _fetchInFlight = false; }
     }
 

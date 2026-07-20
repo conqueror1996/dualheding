@@ -12,9 +12,14 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9"
 }
 
-# ── Baccarat bet types ──
-BACCARAT_PLAYER_BET_TYPE = 18
-BACCARAT_BANKER_BET_TYPE = 19
+# ── Andar Bahar bet types (discovered from 7Mojos JS source decompilation) ──
+ANDAR_BET_TYPE = 0
+BAHAR_BET_TYPE = 0
+ANDAR_SIDE = 0
+BAHAR_SIDE = 1
+
+# ── Twin Andar Bahar table tokens (identical game, different skins) ──
+ANDAR_BAHAR_TOKENS = ["ab-3", "ab-4"]  # e - Andar Bahar + Winmatch Andar Bahar
 
 # ── Telegram Bot Integration ──
 TELEGRAM_BOT_TOKEN = "8926228936:AAGL1eMo6fl_dJS3qpsgiC0v_m7DbH8nz1s" # Your bot token from BotFather
@@ -22,11 +27,14 @@ TELEGRAM_CHAT_ID = ""   # Your personal chat ID, to receive alerts
 TELEGRAM_ENABLED = True # Global toggle to turn the bot polling on/off
 
 # ── Proxy Configuration ──
-# Brightdata ISP Proxy configuration
-PROXY_URL = "http://brd-customer-hl_a5cf638e-zone-isp_proxy1:f54kwk6bb5ve@brd.superproxy.io:33335"
-BACKUP_PROXY_URL = "http://brd-customer-hl_a5cf638e-zone-isp_proxy1:f54kwk6bb5ve@brd.superproxy.io:33335"
+# Dataimpulse proxy configuration (Brightdata zone is Scraping Browser only)
+_PROXY_PRIMARY = "http://59c5680fcd9f590f2857__cr.in:523d198218fc4642@gw.dataimpulse.com:823"
+_PROXY_BACKUP  = "http://59c5680fcd9f590f2857__cr.in:523d198218fc4642@gw.dataimpulse.com:823"
+
+PROXY_URL = _PROXY_PRIMARY
+BACKUP_PROXY_URL = _PROXY_BACKUP
 import logging as _log
-_log.getLogger("config").info("⚙️ Brightdata Proxy configured and ENABLED")
+_log.getLogger("config").info("🖥️ Dataimpulse Proxy Configuration enabled")
 
 CURRENT_PROXY_URL = PROXY_URL
 
@@ -36,14 +44,22 @@ def get_current_proxy(session_id=None):
         return None
     if session_id:
         try:
-            # Inject ;sessid.ID into proxy username
             parts = CURRENT_PROXY_URL.split('@')
             cred_part = parts[0].replace("http://", "")
             host_part = parts[1]
             user, pwd = cred_part.split(':')
-            if "sessid" in user:
-                user = user.split(';sessid')[0]
-            sticky_user = f"{user};sessid.{session_id}"
+            
+            # Check if using Brightdata proxy
+            if "brd.superproxy.io" in host_part or "brd-" in user:
+                if "-session-" in user:
+                    user = user.split('-session-')[0]
+                sticky_user = f"{user}-session-{session_id}"
+            else:
+                # Default to Dataimpulse format
+                if ";sessid" in user:
+                    user = user.split(';sessid')[0]
+                sticky_user = f"{user};sessid.{session_id}"
+                
             return f"http://{sticky_user}:{pwd}@{host_part}"
         except Exception:
             return CURRENT_PROXY_URL
