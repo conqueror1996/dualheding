@@ -787,6 +787,11 @@ class BaccaratManager:
                                 self.tables[game_token]['status'] = "Dealing"
                                 self.tables[game_token]['is_betting_open'] = False
                                 self.tables[game_token]['frame_ready'] = False
+                            elif inner_type in (4, 8):
+                                if game_token in self.pending_bet_acks and self.pending_bet_acks[game_token]['status'] == 'pending':
+                                    self.pending_bet_acks[game_token]['status'] = 'confirmed'
+                                    self.pending_bet_acks[game_token]['raw'] = str(inner_data)[:200]
+                                    logger.info(f"[{self.name}] [{tname}] 🎉 BET CONFIRMED by server (inner_type={inner_type})")
                             elif inner_type == 1:
                                 # inner_type:1 = game state update (may contain bet info)
                                 if game_token in self.pending_bet_acks:
@@ -1126,55 +1131,11 @@ class BaccaratManager:
         
     def stop(self):
         self.running = False
-        
-        # 1. Close all raw TCP/WS sockets immediately to prevent ghost background messages
-        for token, info in list(self.tables.items()):
-            ws = info.get('ws')
-            if ws:
-                try:
-                    transport = getattr(ws, 'transport', None)
-                    if transport:
-                        transport.close()
-                except Exception:
-                    pass
-                if self.loop and self.loop.is_running():
-                    try:
-                        self.loop.call_soon_threadsafe(lambda w=ws: asyncio.create_task(w.close()))
-                    except Exception:
-                        pass
-            info['ws'] = None
-            info['status'] = "Disconnected"
-            info['is_betting_open'] = False
-
-        # 2. Cancel all active asyncio tasks in loop
-        if self.loop and self.loop.is_running():
-            for task in list(self.active_tasks):
-                try:
-                    self.loop.call_soon_threadsafe(task.cancel)
-                except Exception:
-                    pass
-            try:
-                self.loop.call_soon_threadsafe(self.loop.stop)
-            except Exception:
-                pass
-
+        if self.loop:
+            for task in list(self.active_tasks):  # snapshot set before iteration
+                self.loop.call_soon_threadsafe(task.cancel)
         self.active_tasks.clear()
-        
-        # 3. Close HTTP session
-        if self.playcric_session:
-            try:
-                self.playcric_session.close()
-            except Exception:
-                pass
-            self.playcric_session = None
-
-        # 4. Wipe stored tables, tokens and credentials clean
-        self.tables.clear()
-        self.csrf_token = None
-        self.player_token = None
-        self.operator_token = None
-        self._username = None
-        self._password = None
+        # Don't clear tables here; running WS tasks still reference them
     def _prebuild_bet_frames(self, game_token):
         """Pre-build raw WebSocket frames for both bet types when betting opens.
         Warms JIT code path. Actual amount is replaced at fire time in <1ms."""
@@ -1405,34 +1366,11 @@ class GlobalCoordinator:
         self.telegram = TelegramBotManager(self)
         self.telegram.start()
         
-    def logout_all(self):
-        """Completely stop and kill all WebSocket connections, tasks, HTTP sessions,
-        stored credentials, hunter loop, and purge memory clean."""
-        self.disarm_auto_bet()
-        for mgr in [getattr(self, 'account1', None), getattr(self, 'account2', None)]:
-            if mgr:
-                try:
-                    mgr.stop()
-                except Exception:
-                    pass
-        
-        self.auto_bet_requested = False
-        self.bet_state = "idle"
-        self.last_bet_result = None
-        self._hedge_undone = False
-        self.bet_history.clear()
-        self.burned_account = None
-        self._burn_detected_at = None
-        self.initial_balance1 = 0.0
-        self.initial_balance2 = 0.0
-        
-        gc.collect()
-        logger.info("🧹 LOGOUT COMPLETE: All WS connections, tasks, sessions, and garbage purged clean.")
-        return {"success": True, "message": "Logged out and all background connections/garbage cleared."}
-
     def perform_login(self, base_url, user1, pass1, user2, pass2):
-        # Stop and kill all existing background connections, tasks and sessions completely
-        self.logout_all()
+        # Stop existing background tasks to prevent ghost connections
+        for mgr in [self.account1, self.account2]:
+            if mgr.running:
+                mgr.stop()
 
         # Force garbage collect old WS objects, frame buffers, cached data
         gc.collect()
@@ -1721,27 +1659,35 @@ class GlobalCoordinator:
                     if ws2 and acc2.loop:
                         acc2_ws_jobs.append((ws2, bet_payloads[(tok, 'acc2')], tname))
                 
-                # Step 3: Fire via ws.send() — asyncio.gather() for TRUE simultaneous send
+                # Step 3: Fire via ws.send() through asyncio — proper framing through proxy
                 fire_start = time.time()
                 send_failed = False
+                futures = []
                 
-                async def _fire_batch(jobs, account_label):
-                    """Fire all table bets on this account's loop simultaneously via gather()."""
-                    async def _one(ws_obj, payload_str, tname_label):
-                        BaccaratManager._log_raw_frame("-->", account_label, tname_label, payload_str)
-                        await ws_obj.send(payload_str)
-                    await asyncio.gather(*[_one(ws, p, t) for ws, p, t in jobs])
+                async def _send_bet(ws_obj, payload_str, account_label, tname_label):
+                    BaccaratManager._log_raw_frame("-->", account_label, tname_label, payload_str)
+                    await ws_obj.send(payload_str)
                 
                 try:
-                    # Fire BOTH loops in parallel — gather() inside each loop fires both tables simultaneously
-                    fut1 = asyncio.run_coroutine_threadsafe(_fire_batch(acc1_ws_jobs, acc1.name), acc1.loop)
-                    fut2 = asyncio.run_coroutine_threadsafe(_fire_batch(acc2_ws_jobs, acc2.name), acc2.loop)
+                    # Fire all Account 1 bets
+                    for ws_obj, payload_str, tname_r in acc1_ws_jobs:
+                        fut = asyncio.run_coroutine_threadsafe(_send_bet(ws_obj, payload_str, acc1.name, tname_r), acc1.loop)
+                        futures.append((fut, f"Acc1-{tname_r}"))
                     
-                    # Wait for both loops to complete (max 2s)
-                    fut1.result(timeout=2.0)
-                    fut2.result(timeout=2.0)
+                    # Fire all Account 2 bets
+                    for ws_obj, payload_str, tname_r in acc2_ws_jobs:
+                        fut = asyncio.run_coroutine_threadsafe(_send_bet(ws_obj, payload_str, acc2.name, tname_r), acc2.loop)
+                        futures.append((fut, f"Acc2-{tname_r}"))
+                    
+                    # Wait for all sends to complete (max 2s)
+                    for fut, label in futures:
+                        try:
+                            fut.result(timeout=2.0)
+                        except Exception as e:
+                            logger.error(f"⚡ Send failed for {label}: {e}")
+                            send_failed = True
                 except Exception as e:
-                    logger.error(f"⚡ Firing failed: {e}")
+                    logger.error(f"⚡ Firing loop execution failed: {e}")
                     send_failed = True
                 
                 fire_elapsed = (time.time() - fire_start) * 1000
@@ -1760,7 +1706,8 @@ class GlobalCoordinator:
                     logger.info(f"⚡ Acc2 [{tname_r}] bet sent via ws.send()")
                 
                 if send_failed:
-                    logger.warning(f"⚡ DIRECT WRITE FAILED ({fire_elapsed:.1f}ms) — re-arming for next round")
+                    logger.warning(f"⚡ DIRECT WRITE FAILED ({fire_elapsed:.1f}ms) — undoing ALL")
+                    self._undo_all_tables(acc1, acc2, tokens_used, tables, bet_amt, bal1_bef, bal2_bef)
                     self._abort_and_rearm(bets, tables, "Direct write failed")
                     return
 
@@ -1864,7 +1811,7 @@ class GlobalCoordinator:
                             acc1.loop
                         )
                 else:
-                    # ❌ NOT ALL CONFIRMED — log and re-arm (NO undo — keeps connections stable)
+                    # ❌ NOT ALL CONFIRMED → UNDO EVERYTHING
                     status_summary = []
                     for tok, info in tables:
                         tname = info.get('name', tok[:8])
@@ -1872,7 +1819,10 @@ class GlobalCoordinator:
                         a2 = acc2.pending_bet_acks.get(tok, {}).get('status', '?')
                         status_summary.append(f"{tname}:P={a1}/B={a2}")
 
-                    logger.warning(f"⚠️ PARTIAL CONFIRMATION: {status_summary} — no undo, re-arming for next round")
+                    logger.error(f"🚨 HEDGE BROKEN — UNDOING ALL BETS: {status_summary}")
+                    self._hedge_undone = True
+
+                    self._undo_all_tables(acc1, acc2, tokens_used, tables, bet_amt, bal1_bef, bal2_bef)
 
                     for tok, _ in tables:
                         acc1.pending_bet_acks.pop(tok, None)
@@ -1880,20 +1830,19 @@ class GlobalCoordinator:
 
                     for b in bets:
                         if b['status'] != 'confirmed':
-                            b['status'] = 'rejected'
-                            b['error'] = b.get('error') or 'Not confirmed by server'
+                            b['status'] = 'undone'
+                            b['error'] = b.get('error') or 'Hedge broken — ALL bets undone'
 
                     self.last_bet_result = {
-                        "type": "partial",
+                        "type": "undone",
                         "tables": [info.get('name', tok[:8]) for tok, info in tables],
                         "bet1": bet_amt, "bet2": bet_amt,
-                        "bets": bets, "hedge_status": "partial",
-                        "reason": f"Partial: {status_summary}"
+                        "bets": bets, "hedge_status": "broken",
+                        "reason": f"Not all 4 confirmed: {status_summary}"
                     }
-                    logger.info("⏹️ Partial confirmation — going idle. Press Arm to bet again.")
-                    self.auto_bet_requested = False
-                    self.bet_state = "idle"
-                    self._stop_hunting()
+                    logger.info("🔄 Auto re-arming for next round...")
+                    self.auto_bet_requested = True
+                    self.bet_state = "armed"
 
               except Exception as e:
                 logger.error(f"🚨 CRITICAL: _fire_and_verify_all CRASHED: {e}")
@@ -1920,12 +1869,164 @@ class GlobalCoordinator:
             "bets": bets, "hedge_status": "aborted",
             "reason": reason
         }
-        logger.info(f"⏹️ Aborted ({reason}) — going idle. Press Arm to bet again.")
-        self.auto_bet_requested = False
-        self.bet_state = "idle"
-        self._stop_hunting()
+        logger.info(f"🔄 Aborted ({reason}) — re-arming for next round...")
+        self.auto_bet_requested = True
+        self.bet_state = "armed"
 
+    def _undo_all_tables(self, acc1, acc2, tokens, tables, bet_amt, bal1_bef, bal2_bef):
+        """Undo bets on ALL tables: instant blast first, then retry+verify."""
+        logger.info(f"↩️↩️ UNDOING ALL {len(tokens)} TABLES...")
+        
+        # ══════════════════════════════════════════════════
+        # STEP 1: INSTANT RAW BLAST (transport.write) — <1ms
+        # Send undo frames BEFORE any async/thread overhead
+        # This ensures undo reaches server while window is open
+        # ══════════════════════════════════════════════════
+        undo_type7 = json.dumps({"arguments": [json.dumps({"type": 7})], "target": "Message", "type": 1}) + '\x1e'
+        undo_clear = json.dumps({"arguments": [{"type": 1, "data": json.dumps({"areBetsInZeroCommMode": False, "bets": [], "gameplayMessageType": 1})}], "target": "Message", "type": 1}) + '\x1e'
+        
+        blast_count = 0
+        for tok, info in tables:
+            tname = info.get('name', tok[:8])
+            for acct, label in [(acc1, 'Acc1'), (acc2, 'Acc2')]:
+                ws = acct.tables.get(tok, {}).get('ws')
+                if ws:
+                    transport = getattr(ws, 'transport', None)
+                    if transport:
+                        try:
+                            # Build raw WS frame for undo type:7
+                            for msg in [undo_type7, undo_clear]:
+                                raw = msg.encode('utf-8')
+                                length = len(raw)
+                                frame = bytearray([0x81])
+                                if length < 126:
+                                    frame.append(0x80 | length)
+                                elif length <= 65535:
+                                    frame.append(0x80 | 126)
+                                    frame.extend(length.to_bytes(2, 'big'))
+                                mask_key = os.urandom(4)
+                                frame.extend(mask_key)
+                                for i in range(length):
+                                    frame.append(raw[i] ^ mask_key[i % 4])
+                                if acct.loop:
+                                    acct.loop.call_soon_threadsafe(transport.write, bytes(frame))
+                                else:
+                                    transport.write(bytes(frame))
+                            blast_count += 1
+                        except Exception as e:
+                            logger.warning(f"↩️ {label} [{tname}] raw undo blast failed: {e}")
+        
+        logger.info(f"↩️ INSTANT BLAST: {blast_count}/{len(tokens)*2} undo frames sent via transport.write()")
+        
+        # ══════════════════════════════════════════════════
+        # STEP 2: ASYNC RETRY + VERIFY (threads) — backup
+        # In case raw blast was ignored, retry via ws.send()
+        # ══════════════════════════════════════════════════
+        undo_threads = []
+        for tok, info in tables:
+            tname = info.get('name', tok[:8])
+            t = threading.Thread(
+                target=self._undo_single_table,
+                args=(acc1, acc2, tok, tname, bet_amt, bal1_bef, bal2_bef),
+                daemon=True
+            )
+            undo_threads.append(t)
+            t.start()
+        for t in undo_threads:
+            t.join(timeout=8)
+        logger.info(f"↩️↩️ ALL TABLES UNDO COMPLETE")
 
+    def _undo_single_table(self, acc1, acc2, token, tname, bet_amt, bal1_bef, bal2_bef):
+        """Undo bets on a single table for both accounts with retry logic."""
+        logger.info(f"↩️ Undoing bets on '{tname}' for both accounts...")
+
+        def _undo_one_account(acct, label, undo_bet_type, bal_bef):
+            if not acct.loop or not acct.loop.is_running():
+                logger.error(f"🚨 {label}: loop not running — CANNOT UNDO!")
+                return
+
+            # If the bet on this table was never confirmed, it means no money was deducted.
+            # We don't need to verify any refund since no bet was placed on this table.
+            initial_status = acct.pending_bet_acks.get(token, {}).get('status', 'pending')
+            if initial_status != 'confirmed':
+                logger.info(f"✅ {label} UNDO on '{tname}' pre-verified (bet status was '{initial_status}', no locked funds)")
+                acct.pending_bet_acks[token] = {'status': 'undone', 'raw': 'Pre-verified'}
+                return
+
+            # Loop to send and verify the undo request
+            for attempt in range(3):
+                # Calculate expected balance for this specific table's undo.
+                # It should be the start balance (bal_bef) minus any OTHER tables that are still confirmed.
+                other_confirmed_count = 0
+                for t_tok, _ in acct.tables.items():
+                    if t_tok != token:
+                        t_status = acct.pending_bet_acks.get(t_tok, {}).get('status')
+                        if t_status == 'confirmed':
+                            other_confirmed_count += 1
+                expected_bal = bal_bef - (other_confirmed_count * bet_amt)
+
+                try:
+                    # 🚀 If attempt > 0, we suspect negative balance lockout! 
+                    # Let's perform a Hard Session Reset.
+                    if attempt > 0:
+                        logger.warning(f"🚨 {label} [{tname}] UNDO verification failed (attempt {attempt}). Suspecting negative balance lockout! Hard-killing transport to force instant reconnect...")
+                        ws = acct.tables.get(token, {}).get('ws')
+                        if ws:
+                            # 1. Force reconnect delay to 50ms (0.05s)
+                            acct.tables[token]['reconnect_delay'] = 0.05
+                            # 2. Hard close TCP transport
+                            try:
+                                if hasattr(ws, 'transport') and ws.transport:
+                                    ws.transport.close()
+                                    logger.info(f"✅ {label} [{tname}] Transport hard closed.")
+                            except Exception as transport_err:
+                                logger.error(f"🚨 {label} [{tname}] Transport close error: {transport_err}")
+                            
+                            # 3. Wait for new socket to connect
+                            reconnected = False
+                            for wait_idx in range(40):  # max 4 seconds
+                                time.sleep(0.1)
+                                current_ws = acct.tables.get(token, {}).get('ws')
+                                if current_ws and current_ws != ws:
+                                    logger.info(f"✅ {label} [{tname}] Reconnection detected! Proceeding to retry UNDO on fresh socket...")
+                                    reconnected = True
+                                    break
+                            if not reconnected:
+                                logger.warning(f"⚠️ {label} [{tname}] Reconnection timed out (4s), retrying on whatever is available...")
+
+                    fut = asyncio.run_coroutine_threadsafe(
+                        acct._undo_bets_async([token], bet_type=undo_bet_type, amount=bet_amt),
+                        acct.loop
+                    )
+                    fut.result(timeout=3)
+                    logger.info(f"✅ {label} UNDO sent on '{tname}' (attempt {attempt+1})")
+                    time.sleep(0.15)
+                    acct.update_balance()
+                    
+                    if acct.balance >= expected_bal - 0.5:
+                        logger.info(f"✅ {label} UNDO VERIFIED: Rs. {acct.balance:.2f}")
+                        acct.pending_bet_acks[token] = {'status': 'undone', 'raw': 'Verified'}
+                        return
+                    else:
+                        logger.warning(f"🚨 {label} UNDO verification failed: bal={acct.balance:.2f} expected={expected_bal:.2f}")
+                        time.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"🚨 {label} UNDO attempt {attempt+1} FAILED: {e}")
+                    time.sleep(0.15)
+
+            # Standard undo failed 3x — log warning, but do NOT close WebSocket
+            # Once window is closed, closing the socket does not cancel the bet on the server anyway.
+            err = f"🚨 CRITICAL: {label} UNDO FAILED on '{tname}' after 3 attempts!"
+            logger.error(err)
+            if self.telegram:
+                self.telegram.send_message(err)
+
+        t1 = threading.Thread(target=_undo_one_account, args=(acc1, "Acc1 (Andar)", acc1.bet_type, bal1_bef), daemon=True)
+        t2 = threading.Thread(target=_undo_one_account, args=(acc2, "Acc2 (Bahar)", acc2.bet_type, bal2_bef), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join(timeout=6)
+        t2.join(timeout=6)
 
     async def _track_bet_result(self, table_names, bal1_before, bal2_before):
         await asyncio.sleep(45)
