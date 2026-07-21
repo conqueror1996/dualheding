@@ -2209,6 +2209,28 @@ class GlobalCoordinator:
         self._stop_hunting()  # Stop the hunter
         return {"success": True, "message": "Auto-Bet disarmed."}
 
+    def fire_all_4_manual(self, mode="auto", amount=100.0):
+        """⚡ Force immediate burst firing on ALL 4 bets across both target tables."""
+        if self.account1.balance <= 0 or self.account2.balance <= 0:
+            return {"success": False, "message": f"Cannot fire: Acc1 bal={self.account1.balance:.2f}, Acc2 bal={self.account2.balance:.2f}"}
+
+        # Ensure we have connected tables on both accounts
+        tables1 = [t for t in self.account1.tables.values() if t.get('ws') and getattr(t.get('ws'), 'open', True)]
+        tables2 = [t for t in self.account2.tables.values() if t.get('ws') and getattr(t.get('ws'), 'open', True)]
+        if len(tables1) < 2 or len(tables2) < 2:
+            return {"success": False, "message": f"Need at least 2 connected tables per account. (Acc1: {len(tables1)}, Acc2: {len(tables2)})"}
+
+        self.bet_mode = mode
+        self.bet_target_amount = float(amount)
+        self.auto_bet_requested = True
+        self.bet_state = "armed"
+        
+        # Trigger immediate check to pounce on all 4 bets
+        with self._bet_lock:
+            self._check_auto_bet_locked()
+
+        return {"success": True, "message": "⚡ Burst-fired ALL 4 bets on 2 tables!"}
+
     def check_burned_accounts(self):
         """Check if either account has gone negative. Called from balance polling.
         Disarms auto-bet, but does NOT automatically burn the account."""

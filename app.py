@@ -634,6 +634,19 @@ def disarm_bet():
     result = coordinator.disarm_auto_bet()
     return jsonify(result)
 
+@app.route('/api/fire_all_4', methods=['POST'])
+def fire_all_4():
+    coordinator = get_coordinator()
+    if not coordinator:
+        return jsonify({"error": "Missing X-Session-ID header"}), 400
+        
+    data = request.json or {}
+    mode = data.get('mode', 'auto')
+    amount = data.get('amount', 100.0)
+    
+    result = coordinator.fire_all_4_manual(mode, amount)
+    return jsonify(result)
+
 @app.route('/api/test_stack', methods=['POST'])
 def test_stack():
     """🧪 Test if 7Mojos server accumulates multiple bets on the same table."""
