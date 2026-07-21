@@ -720,6 +720,8 @@ def get_logs():
 
 @app.route('/api/js_error', methods=['POST'])
 def js_error():
+    import logging
+    logger = logging.getLogger("ws_manager")
     data = request.json or {}
     msg = data.get('message', 'Unknown')
     stack = data.get('stack', '')
