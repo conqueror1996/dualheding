@@ -2226,11 +2226,21 @@ class GlobalCoordinator:
             logger.warning(f"⚡ [MANUAL FIRE ALL 4] {msg}")
             return {"success": False, "message": msg}
 
-        # Check betting window status
-        open1 = [t.get('name', '?') for t in tables1 if t.get('is_betting_open')]
-        open2 = [t.get('name', '?') for t in tables2 if t.get('is_betting_open')]
-        if len(open1) < 2 or len(open2) < 2:
-            msg = f"Waiting for betting window to open on both tables! Open tables: Acc1={open1}, Acc2={open2}. (Tables currently dealing cards)"
+        # Check betting window status (wait up to 1.5s if windows are just opening)
+        start_wait = time.time()
+        ready = False
+        while time.time() - start_wait < 1.5:
+            open1 = [t.get('name', '?') for t in tables1 if t.get('is_betting_open')]
+            open2 = [t.get('name', '?') for t in tables2 if t.get('is_betting_open')]
+            if len(open1) >= 2 and len(open2) >= 2:
+                ready = True
+                break
+            time.sleep(0.05)
+
+        if not ready:
+            open1 = [t.get('name', '?') for t in tables1 if t.get('is_betting_open')]
+            open2 = [t.get('name', '?') for t in tables2 if t.get('is_betting_open')]
+            msg = f"Betting closed! Open tables: Acc1={open1}, Acc2={open2}. (Dealer is currently dealing cards — click when status turns green BETTING)"
             logger.warning(f"⚡ [MANUAL FIRE ALL 4] {msg}")
             return {"success": False, "message": msg}
 
