@@ -2211,14 +2211,28 @@ class GlobalCoordinator:
 
     def fire_all_4_manual(self, mode="auto", amount=100.0):
         """⚡ Force immediate burst firing on ALL 4 bets across both target tables."""
+        logger.info(f"⚡ [MANUAL FIRE ALL 4] Button clicked! Acc1={self.account1.balance:.2f}, Acc2={self.account2.balance:.2f}")
+
         if self.account1.balance <= 0 or self.account2.balance <= 0:
-            return {"success": False, "message": f"Cannot fire: Acc1 bal={self.account1.balance:.2f}, Acc2 bal={self.account2.balance:.2f}"}
+            msg = f"Cannot fire: Acc1 balance=₹{self.account1.balance:.2f}, Acc2 balance=₹{self.account2.balance:.2f}. Both accounts need balance > 0."
+            logger.warning(f"⚡ [MANUAL FIRE ALL 4] {msg}")
+            return {"success": False, "message": msg}
 
         # Ensure we have connected tables on both accounts
         tables1 = [t for t in self.account1.tables.values() if t.get('ws') and getattr(t.get('ws'), 'open', True)]
         tables2 = [t for t in self.account2.tables.values() if t.get('ws') and getattr(t.get('ws'), 'open', True)]
         if len(tables1) < 2 or len(tables2) < 2:
-            return {"success": False, "message": f"Need at least 2 connected tables per account. (Acc1: {len(tables1)}, Acc2: {len(tables2)})"}
+            msg = f"Need at least 2 connected tables per account. (Acc1 connected: {len(tables1)}, Acc2 connected: {len(tables2)})"
+            logger.warning(f"⚡ [MANUAL FIRE ALL 4] {msg}")
+            return {"success": False, "message": msg}
+
+        # Check betting window status
+        open1 = [t.get('name', '?') for t in tables1 if t.get('is_betting_open')]
+        open2 = [t.get('name', '?') for t in tables2 if t.get('is_betting_open')]
+        if len(open1) < 2 or len(open2) < 2:
+            msg = f"Waiting for betting window to open on both tables! Open tables: Acc1={open1}, Acc2={open2}. (Tables currently dealing cards)"
+            logger.warning(f"⚡ [MANUAL FIRE ALL 4] {msg}")
+            return {"success": False, "message": msg}
 
         self.bet_mode = mode
         self.bet_target_amount = float(amount)
